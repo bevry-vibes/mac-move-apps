@@ -1,5 +1,8 @@
 # mac-move-apps
 
+[![macOS](https://img.shields.io/badge/macOS-12%2B-blue)](https://www.apple.com/macos/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Move macOS `.app` bundles to an external drive safely while keeping them fully functional via symlinks.
 
 This tool is especially useful when your internal SSD is running out of space but you still want apps to appear in Launchpad, Spotlight, and the Dock normally.
