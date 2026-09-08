@@ -1,3 +1,4 @@
+#!/usr/bin/env pwsh
 #Requires -Version 7.6
 <#
 .SYNOPSIS
@@ -168,9 +169,11 @@ function Resolve-AppName {
 }
 
 function Resolve-AppBundle {
-    # Locate an app bundle by name in the search dirs, or accept a direct path.
+    # Locate an app bundle by name in the search dirs, or accept a direct path
+    # (~ and relative paths expanded for the direct-path form).
     param([Parameter(Mandatory)] [string]$AppFile)
     if ($AppFile -match '/') {
+        $AppFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppFile)
         return (Test-Path -LiteralPath $AppFile) ? (Get-Item -LiteralPath $AppFile).FullName : $null
     }
     foreach ($dir in $SearchDirs) {
@@ -340,6 +343,7 @@ function Read-MultiChoice {
     )
     if ([Console]::IsInputRedirected) { throw 'Read-MultiChoice requires an interactive console' }
     $focusIndex = @(for ($i = 0; $i -lt $Options.Count; $i++) { if (-not $Options[$i].Locked) { $i } })
+    if ($focusIndex.Count -eq 0) { return , @() }
     $chosen = [System.Collections.Generic.HashSet[int]]::new()
     $cursor = 0
     $top = 0
@@ -426,7 +430,7 @@ function Test-AppReadyToMove {
         Write-Caution "$(Split-Path $Src -Leaf) is already a symlink to $(@($item.Target)[0]) - nothing to move."
         return $false
     }
-    $null = pgrep -f "$Src/"
+    $null = pgrep -f ([regex]::Escape("$Src/"))
     if ($LASTEXITCODE -eq 0) {
         Write-Caution "$(Split-Path $Src -Leaf) is running - quit it completely before moving."
         return $false
@@ -471,17 +475,18 @@ function Invoke-LibraryMove {
         if (-not (Test-Path -LiteralPath $libPath)) { continue }
         if ((Get-Item -LiteralPath $libPath -Force).LinkType) { continue }
         $dest = Join-Path $LibRoot $rel
-        $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force
-        Write-Info "moving ~/Library/$rel"
         try {
+            # library relocation is best-effort: one bad entry never fails the move
+            [void][System.IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
+            Write-Info "moving ~/Library/$rel"
             Invoke-Tool ditto @($libPath, $dest)
             Invoke-Tool rm @('-rf', $libPath)
+            Invoke-Tool ln @('-s', $dest, $libPath)
         } catch {
             Write-Caution "could not move ~/Library/${rel}: $_"
             $null = Invoke-Tool rm @('-rf', $dest) -Tolerant
             continue
         }
-        $null = New-Item -ItemType SymbolicLink -Path $libPath -Target $dest
         $moved++
     }
     return $moved
@@ -510,7 +515,7 @@ function Invoke-LibraryRestore {
                     continue
                 }
             }
-            $null = New-Item -ItemType Directory -Path (Split-Path $homePath -Parent) -Force
+            $null = [System.IO.Directory]::CreateDirectory((Split-Path $homePath -Parent))
             try {
                 Invoke-Tool mv @($item.FullName, $homePath)
             } catch {
@@ -532,23 +537,42 @@ function Invoke-BundleMove {
         [Parameter(Mandatory)] [string]$Src,
         [Parameter(Mandatory)] [string]$DestDir
     )
+    # expand ~ and relative destinations - native tools take them literally otherwise
+    $DestDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestDir)
     $appFile = Split-Path $Src -Leaf
+    $name = $appFile -replace '\.app$', ''
+
     $destParent = Split-Path $DestDir -Parent
     if (-not (Test-Path -LiteralPath $destParent)) {
         Write-Failure "destination drive is not mounted: $destParent"
         return $false
     }
-    $null = New-Item -ItemType Directory -Path $DestDir -Force
     $dst = Join-Path $DestDir $appFile
 
-    if (Test-Path -LiteralPath $dst) {
-        if ($Force) {
-            Write-Caution "destination exists, overwriting: $dst"
-            Remove-Item -LiteralPath $dst -Recurse -Force
-        } else {
-            Write-Failure "destination already exists: $dst (re-run with -Force to overwrite)"
-            return $false
+    # refuse destinations that resolve onto the source - -Force would rm the app itself
+    $ordinal = [System.StringComparison]::OrdinalIgnoreCase
+    if ($dst.Equals($Src, $ordinal) -or
+        $dst.StartsWith("$Src/", $ordinal) -or
+        $Src.StartsWith("$DestDir/", $ordinal)) {
+        Write-Failure "destination $DestDir overlaps the source $Src - refusing to move."
+        return $false
+    }
+
+    try {
+        # .NET call: literal path creation, unlike New-Item's wildcard-mangled -Path
+        [void][System.IO.Directory]::CreateDirectory($DestDir)
+        if (Test-Path -LiteralPath $dst) {
+            if ($Force) {
+                Write-Caution "destination exists, overwriting: $dst"
+                Remove-Item -LiteralPath $dst -Recurse -Force
+            } else {
+                Write-Failure "destination already exists: $dst (re-run with -Force to overwrite)"
+                return $false
+            }
         }
+    } catch {
+        Write-Failure "cannot prepare the destination: $_"
+        return $false
     }
 
     Write-Info "moving $Src"
@@ -561,6 +585,7 @@ function Invoke-BundleMove {
         Invoke-Tool ditto @($Src, $dst)
     } catch {
         Write-Failure "ditto copy failed: $_"
+        $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
         return $false
     }
 
@@ -579,7 +604,15 @@ function Invoke-BundleMove {
         }
     }
 
-    $null = New-Item -ItemType SymbolicLink -Path $Src -Target $dst
+    # ln -s: literal names (bracket-safe), and it fails rather than overwrites
+    Write-Info 'creating the symlink back...'
+    try {
+        Invoke-Tool ln @('-s', $dst, $Src)
+    } catch {
+        Write-Failure "could not symlink $Src to ${dst}: $_"
+        Write-Caution "the bundle is safe at $dst - restore it manually with: ln -s `"$dst`" `"$Src`""
+        return $false
+    }
 
     # clear quarantine and re-sign so Gatekeeper accepts the relocated bundle
     Write-Info 'clearing extended attributes and re-signing...'
@@ -589,12 +622,20 @@ function Invoke-BundleMove {
     Write-Info 're-registering with LaunchServices...'
     $null = Invoke-Tool $LsRegister @('-f', $dst) -Tolerant
 
-    # relocate the app's ~/Library footprint next to the bundle on the volume
-    $name = $appFile -replace '\.app$', ''
-    $libRoot = Join-Path (Split-Path $DestDir -Parent) "App Library/$name"
-    $libMoved = Invoke-LibraryMove -AppName $name -BundlePath $Src -LibRoot $libRoot
-
-    Write-Info "moved $appFile to $dst$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')"
+    # relocate the app's ~/Library footprint next to the bundle on the volume;
+    # skipped for root-level destinations, which have no sensible sibling spot
+    if ($destParent -ne '/' -and $destParent -ne '/Volumes') {
+        $libRoot = Join-Path $destParent "App Library/$name"
+        $libMoved = 0
+        try {
+            $libMoved = Invoke-LibraryMove -AppName $name -BundlePath $Src -LibRoot $libRoot
+        } catch {
+            Write-Caution "library relocation failed for $name (the bundle move is unaffected): $_"
+        }
+        Write-Info "moved $appFile to $dst$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')"
+    } else {
+        Write-Info "moved $appFile to $dst (~/Library entries stay put - destination has no sibling dir)"
+    }
     return $true
 }
 
@@ -664,7 +705,8 @@ function Invoke-MoveBatch {
 function Invoke-Move {
     if (-not $AppName) { Invoke-MoveBatch; return }
     $appFile = Resolve-AppName $AppName
-    $name = $appFile -replace '\.app$', ''
+    # tier checks key off the bundle name, so a locked app named by path cannot slip past
+    $name = (Split-Path $appFile -Leaf) -replace '\.app$', ''
     $src = Resolve-AppBundle $appFile
     if (-not $src) {
         Write-Failure "app not found in $($SearchDirs -join ' or '): $appFile"
@@ -726,8 +768,8 @@ function Invoke-Restore {
             Write-Host 'failed'
             Write-Caution "  could not restore $($app.Name): $_"
             # relink so the external copy stays reachable
-            if (-not (Test-Path -LiteralPath $app.LinkPath)) {
-                $null = New-Item -ItemType SymbolicLink -Path $app.LinkPath -Target $app.Target
+            if (-not (Test-Path -LiteralPath $homePath)) {
+                $null = Invoke-Tool ln @('-s', $app.Target, $app.LinkPath) -Tolerant
             }
             $failed++
         }

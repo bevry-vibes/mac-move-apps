@@ -23,6 +23,8 @@ pwsh -File ./mac-move-apps.ps1 restore -DryRun                                  
 pwsh -File ./mac-move-apps.ps1 refresh IINA -ForceRepair                                # re-register a moved app
 ```
 
+The script has a `pwsh` shebang — `chmod +x ./mac-move-apps.ps1` once, then `./mac-move-apps.ps1 move` works directly.
+
 | Command | What it does |
 | --- | --- |
 | `move [app] [destination]` | Copies the bundle with `ditto`, replaces the original with a symlink, clears quarantine, ad-hoc re-signs, re-registers with LaunchServices — and relocates the app's `~/Library` footprint (Application Support, Caches, Logs, WebKit, HTTPStorages, Saved Application State) to the volume's `App Library` folder, symlinking those back too. With no app given, an arrow-key multiselect lists every installed app. |
