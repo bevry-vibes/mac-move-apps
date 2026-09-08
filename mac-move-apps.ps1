@@ -6,21 +6,35 @@
 .DESCRIPTION
     Single command wrapping the full app-relocation workflow:
 
-      move <app> [destination]   Copy the .app bundle to external storage with ditto,
+      move [app] [destination]   Copy the .app bundle to external storage with ditto,
                                  replace the original with a symlink, clear quarantine,
                                  ad-hoc re-sign, and re-register with LaunchServices.
-                                 When the destination is omitted, the command asks
-                                 where the app should go, offering mounted volumes.
-      restore                    Move every externally-stored app back to the internal disk.
+                                 The app's ~/Library footprint (Application Support,
+                                 Caches, Logs, WebKit, HTTPStorages, Saved Application
+                                 State) moves to the volume's 'App Library' folder too,
+                                 symlinked back. With no app given, an interactive
+                                 multiselect lists every installed app. When the
+                                 destination is omitted, the command asks where the
+                                 app should go, offering mounted volumes.
+      restore                    Move every externally-stored app - and its ~/Library
+                                 entries - back to the internal disk.
       list                       Show installed apps categorised by how safe they are to move.
       status                     Show apps already moved to external storage.
       refresh <app>              Re-register an app with LaunchServices and refresh
                                  Dock, Finder, and Spotlight; -ForceRepair also
                                  clears xattrs and re-signs.
 
+    The move-safety tiers are enforced, not advisory: apps on the caution or avoid
+    lists are locked in the multiselect and refused by direct move.
+
     Apps are searched for in /Applications and ~/Applications.
 
     Exit codes: 0 = success, 1 = failure, 2 = usage error.
+
+.EXAMPLE
+    pwsh -File ./mac-move-apps.ps1 move
+
+    Multiselect across every installed app, then asks where the apps should go.
 
 .EXAMPLE
     pwsh -File ./mac-move-apps.ps1 move 'Visual Studio Code'
@@ -74,24 +88,56 @@ $AppAliases = @{
     'karabiner' = 'Karabiner-Elements'
 }
 
-# Curated move-safety tiers: pure GUI apps survive relocation cleanly; apps with
-# privileged helpers, system extensions, virtualisation, or deep system integration do not.
+# Curated move-safety tiers, audited against the apps installed on this machine.
+# These are enforced, not advisory: caution and avoid apps cannot be moved.
+#   avoid   - installs drivers, system/network extensions, root helpers, or launchd
+#             services; or patches the system (Apple pro media apps included).
+#   caution - relies on integration that references its install path or keys
+#             permissions to it (browser native messaging, accessibility/TCC grants,
+#             driver installers, App Store Apple apps, terminals).
+#   safe    - self-contained GUI apps with no system integration.
 $MoveTiers = [ordered]@{
     safe = @(
-        'Android Studio', 'Audacity', 'Blender', 'Brave Browser', 'ChatGPT', 'DBeaver',
-        'draw.io', 'FreeCAD', 'GIMP', 'Google Chrome', 'Hidden Bar', 'IINA', 'Inkscape',
-        'KeyCastr', 'LocalSend', 'Microsoft Edge', 'MongoDB Compass', 'Motrix',
-        'Pearcleaner', 'Telegram', 'Tor Browser', 'Visual Studio Code'
+        '0 A.D.', 'Aural', 'Amazon Kindle', 'Android Studio', 'AnythingLLM', 'Audacity',
+        'balenaEtcher', 'Beeper Desktop', 'Bible', 'Blender', 'Brave Browser', 'BusyCal',
+        'BusyContacts', 'Byword', 'calibre', 'ChatGPT', 'Claude', 'DBeaver', 'Discord',
+        'draw.io', 'Duplicate File Finder', 'eero', 'Endel', 'Firefox', 'Flighty',
+        'FreeCAD', 'GIMP', 'GitHub Copilot', 'GitHub Desktop', 'GoPro Player',
+        'Google Chrome', 'Hidden Bar', 'IINA', 'Inkscape', 'Jellyfin', 'Kagi Search',
+        'Kamusku', 'KeepingYouAwake', 'KeyCastr', 'keyviz', 'Lapce', 'Libation',
+        'LocalSend', 'Microsoft Edge', 'MongoDB Compass', 'Motrix', 'Numi',
+        'ONLYOFFICE', 'Open WebUI', 'OpenAudible', 'Orion', 'PDFgear', 'Pearcleaner',
+        'Plex', 'Plexamp', 'Prologue', 'Proton Meet', 'Readest', 'Revu',
+        'Script Debugger', 'Shazam', 'Shop', 'Shortcut Remote', 'Signal', 'Sketch',
+        'Sorted³', 'SpotiFLAC-Next', 'SQLiteo', 'Super Productivity', 'Telegram',
+        'Thunderbird', 'Tor Browser', 'Vivaldi', 'Visual Studio Code', 'Waterfox',
+        'WhatsApp', 'ZCode', 'Zed'
     )
     caution = @(
-        'Android File Transfer', 'Hammerspoon', 'iTerm', 'Karabiner-Elements',
-        'Karabiner-EventViewer', 'Microsoft Excel', 'Microsoft PowerPoint',
-        'Microsoft Word', 'Ollama'
+        '1Password', 'Alfred 5', 'Android File Transfer', 'Elgato Camera Hub',
+        'Elgato Capture Device Utility', 'Elgato Control Center', 'Elgato Stream Deck',
+        'Elgato Studio', 'Ghostty', 'Hammerspoon', 'iTerm', 'Karabiner-EventViewer',
+        'Keynote', 'LG Screen Manager', 'Microsoft Excel', 'Microsoft PowerPoint',
+        'Microsoft Word', 'Numbers', 'OBS', 'Ollama', 'Pages', 'QuickLook Video',
+        'Routine Screenshot', 'Swish', 'Toggle Office Lights', 'UI Browser', 'Vidimote',
+        'Wox', 'zoom.us'
     )
     avoid = @(
-        'Docker', 'ExpressVPN', 'iMovie', 'lghub', 'OrbStack', 'Parallels Desktop',
-        'Safari', 'Tailscale', 'VMware Fusion', 'Xcode'
+        'Adguard', 'Audio Hijack', 'Backblaze', 'BackblazeRestore', 'Compressor',
+        'DaVinci Resolve', 'Docker', 'ExpressVPN', 'Final Cut Pro', 'iMovie',
+        'Karabiner-Elements', 'lghub', 'Loopback', 'OpenCore-Patcher', 'OrbStack',
+        'Parallels Desktop', 'Plex Media Server', 'RustDesk', 'Safari', 'SoundSource',
+        'Syncthing', 'Tailscale', 'VMware Fusion', 'Xcode'
     )
+}
+
+function Get-MoveTier {
+    # Look up an app's safety tier: safe | caution | avoid, or unlisted when unknown.
+    param([Parameter(Mandatory)] [string]$Name)
+    foreach ($tier in $MoveTiers.Keys) {
+        if ($MoveTiers[$tier] -contains $Name) { return $tier }
+    }
+    return 'unlisted'
 }
 
 function Write-Info    { param([string]$Message) Write-Host "$($PSStyle.Foreground.BrightBlue)info $Message$($PSStyle.Reset)" }
@@ -208,11 +254,18 @@ function Show-Usage {
 Usage: pwsh -File ./mac-move-apps.ps1 <command> [arguments] [options]
 
 Commands:
-  move <app> [destination]  Move an app bundle to external storage and symlink
-                            it back. Asks where the app should go when the
-                            destination is omitted. The app is a name (aliases
-                            supported, .app suffix optional) or a bundle path.
-  restore                   Move every externally-stored app back to the internal disk.
+  move [app] [destination]  Move an app bundle and its ~/Library footprint
+                            (Application Support, Caches, Logs, WebKit,
+                            HTTPStorages, Saved Application State) to external
+                            storage, symlinking both back. With no app, an
+                            interactive multiselect lists every installed app.
+                            Asks where the app(s) should go when the destination
+                            is omitted. The app is a name (aliases supported,
+                            .app suffix optional) or a bundle path. Caution and
+                            avoid list apps are locked in the multiselect and
+                            refused when named.
+  restore                   Move every externally-stored app - and its ~/Library
+                            entries - back to the internal disk.
   list                      Show installed apps categorised by move safety.
   status                    Show apps already moved to external storage.
   refresh <app>             Refresh LaunchServices, Dock, Finder, and Spotlight
@@ -225,6 +278,7 @@ Options:
   -ForceRepair  refresh: also clear xattrs and re-sign the app.
 
 Examples:
+  pwsh -File ./mac-move-apps.ps1 move
   pwsh -File ./mac-move-apps.ps1 move 'Visual Studio Code'
   pwsh -File ./mac-move-apps.ps1 move Motrix /Volumes/Scratchpad/Applications
   pwsh -File ./mac-move-apps.ps1 restore -DryRun
@@ -259,6 +313,7 @@ function Show-MovableList {
         }
     }
     Write-Host ''
+    Write-Host 'Caution and avoid apps cannot be moved; safe apps are recommended.'
     Write-Host 'Unlisted apps: use your judgement - anything with privileged helpers,'
     Write-Host 'system extensions, or an updater that checks its own path stays put.'
 }
@@ -273,35 +328,218 @@ function Show-Status {
     Write-Info "$($moved.Count) app(s) living on external storage."
 }
 
-function Invoke-Move {
-    if (-not $AppName) { Show-Usage }
-    $appFile = Resolve-AppName $AppName
-    $src = Resolve-AppBundle $appFile
-    if (-not $src) {
-        Write-Failure "app not found in $($SearchDirs -join ' or '): $appFile"
-        exit 1
+function Read-MultiChoice {
+    # Arrow-key multiselect over Options (Name, Note, Locked), following the input
+    # pattern of bevry-vibes menu.ps1: typed key comparisons, Ctrl+C captured as an
+    # ordinary key, in-place redraw, console state restored in finally. Locked
+    # entries render dimmed and can be neither focused nor toggled. Returns the
+    # chosen names (empty = confirmed nothing), or $null when cancelled/aborted.
+    param(
+        [Parameter(Mandatory)] [pscustomobject[]]$Options,
+        [string]$Title = 'Select'
+    )
+    if ([Console]::IsInputRedirected) { throw 'Read-MultiChoice requires an interactive console' }
+    $focusIndex = @(for ($i = 0; $i -lt $Options.Count; $i++) { if (-not $Options[$i].Locked) { $i } })
+    $chosen = [System.Collections.Generic.HashSet[int]]::new()
+    $cursor = 0
+    $top = 0
+    $visible = [Math]::Min($Options.Count, 12)
+    $lastCount = 0
+    $firstDraw = $true
+    $esc = [char]27
+    $reset = $PSStyle.Reset
+    $dim = $PSStyle.Dim
+    $green = $PSStyle.Foreground.Green
+    $bold = $PSStyle.Bold
+    $previousTreatControlC = [Console]::TreatControlCAsInput
+
+    Write-Host ''
+    Write-Host "$bold$Title$reset"
+    Write-Host 'up/down or j/k move · space toggle · a all · n none · enter confirm · q or esc cancel'
+    Write-Host 'Locked entries (caution / do-not-move) cannot be selected.'
+
+    try {
+        [Console]::TreatControlCAsInput = $true
+        # CursorVisible's getter throws on macOS, so save nothing and just restore
+        [Console]::CursorVisible = $false
+        while ($true) {
+            if ($cursor -lt $top) { $top = $cursor }
+            if ($cursor -ge $top + $visible) { $top = $cursor - $visible + 1 }
+            if ($Options.Count -gt $visible) { $top = [Math]::Min($top, $Options.Count - $visible) }
+            $lines = @()
+            if ($top -gt 0) { $lines += "$dim  …$reset" }
+            for ($i = $top; $i -lt [Math]::Min($top + $visible, $Options.Count); $i++) {
+                $opt = $Options[$i]
+                if ($opt.Locked) {
+                    $lines += "$dim  [locked] $($opt.Name) - $($opt.Note)$reset"
+                } else {
+                    $box = $chosen.Contains($i) ? "$green[x]$reset" : '[ ]'
+                    $arrow = ($focusIndex[$cursor] -eq $i) ? "$bold>$reset " : '  '
+                    $lines += "$arrow$box $($opt.Name)$dim $($opt.Note)$reset"
+                }
+            }
+            if ($top + $visible -lt $Options.Count) { $lines += "$dim  …$reset" }
+            if (-not $firstDraw) { [Console]::Write("$esc[$($lastCount)A") }
+            $firstDraw = $false
+            foreach ($line in $lines) { [Console]::Write("$line$esc[K`r`n") }
+            $lastCount = $lines.Count
+
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq [ConsoleKey]::Enter) { break }
+            if ($key.Key -eq [ConsoleKey]::Escape) { return $null }
+            if ($key.Key -eq [ConsoleKey]::C -and ($key.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
+            if ($key.Key -eq [ConsoleKey]::UpArrow) {
+                $cursor = ($cursor - 1 + $focusIndex.Count) % $focusIndex.Count
+            } elseif ($key.Key -eq [ConsoleKey]::DownArrow) {
+                $cursor = ($cursor + 1) % $focusIndex.Count
+            } elseif ($key.Key -eq [ConsoleKey]::Home) {
+                $cursor = 0
+            } elseif ($key.Key -eq [ConsoleKey]::End) {
+                $cursor = $focusIndex.Count - 1
+            } elseif ($key.Key -eq [ConsoleKey]::Spacebar) {
+                $i = $focusIndex[$cursor]
+                if ($chosen.Contains($i)) { [void]$chosen.Remove($i) } else { [void]$chosen.Add($i) }
+            } else {
+                $c = [char]$key.KeyChar
+                if ($c -eq 'j') { $cursor = ($cursor + 1) % $focusIndex.Count }
+                elseif ($c -eq 'k') { $cursor = ($cursor - 1 + $focusIndex.Count) % $focusIndex.Count }
+                elseif ($c -eq 'a' -or $c -eq 'A') { foreach ($i in $focusIndex) { [void]$chosen.Add($i) } }
+                elseif ($c -eq 'n' -or $c -eq 'N') { $chosen.Clear() }
+                elseif ($c -eq 'q' -or $c -eq 'Q') { return $null }
+            }
+        }
+    } finally {
+        [Console]::TreatControlCAsInput = $previousTreatControlC
+        # best-effort: some terminals reject the restore once the picker is over
+        try { [Console]::CursorVisible = $true } catch { Write-Host '' }
     }
-    $item = Get-Item -LiteralPath $src
+    # the comma prevents PowerShell unrolling an empty selection into $null
+    $names = @($focusIndex | Where-Object { $chosen.Contains($_) } | ForEach-Object { $Options[$_].Name })
+    return , $names
+}
+
+function Test-AppReadyToMove {
+    # Refuse already-symlinked and running apps. Reports the reason itself.
+    param([Parameter(Mandatory)] [string]$Src)
+    $item = Get-Item -LiteralPath $Src
     if ($item.LinkType -eq 'SymbolicLink') {
-        Write-Caution "$appFile is already a symlink to $(@($item.Target)[0]) - nothing to move."
-        exit 1
+        Write-Caution "$(Split-Path $Src -Leaf) is already a symlink to $(@($item.Target)[0]) - nothing to move."
+        return $false
     }
-
-    # a running app cannot be moved safely
-    $null = pgrep -f "$src/"
+    $null = pgrep -f "$Src/"
     if ($LASTEXITCODE -eq 0) {
-        Write-Failure "$appFile is running - quit it completely before moving."
-        exit 1
+        Write-Caution "$(Split-Path $Src -Leaf) is running - quit it completely before moving."
+        return $false
     }
+    return $true
+}
 
-    $destDir = if ($Destination) { $Destination } else { Read-Destination }
-    $destParent = Split-Path $destDir -Parent
+function Get-AppBundleIdentifier {
+    # Read CFBundleIdentifier from an app bundle's Info.plist; '' when unreadable.
+    param([Parameter(Mandatory)] [string]$BundlePath)
+    $plist = Join-Path $BundlePath 'Contents/Info.plist'
+    if (-not (Test-Path -LiteralPath $plist)) { return '' }
+    $id = Invoke-Tool plutil @('-extract', 'CFBundleIdentifier', 'raw', '-o', '-', $plist) -Tolerant
+    return "$id".Trim()
+}
+
+function Invoke-LibraryMove {
+    # Relocate the app's ~/Library footprint - the big stuff: Application Support,
+    # Caches, Logs, WebKit, HTTPStorages, Saved Application State - to LibRoot,
+    # symlinking the original locations back. Preferences, Containers, and Group
+    # Containers deliberately stay put: cfprefsd and sandbox path evaluation
+    # misbehave through symlinks. Returns the number of entries moved.
+    param(
+        [Parameter(Mandatory)] [string]$AppName,
+        [Parameter(Mandatory)] [string]$BundlePath,
+        [Parameter(Mandatory)] [string]$LibRoot
+    )
+    $bundleId = Get-AppBundleIdentifier $BundlePath
+    $relPaths = @("Application Support/$AppName", "Logs/$AppName")
+    if ($bundleId) {
+        $relPaths += @(
+            "Application Support/$bundleId"
+            "Caches/$bundleId"
+            "Saved Application State/$bundleId.savedState"
+            "WebKit/$bundleId"
+            "HTTPStorages/$bundleId"
+        )
+    }
+    $moved = 0
+    foreach ($rel in ($relPaths | Select-Object -Unique)) {
+        $libPath = Join-Path "$HOME/Library" $rel
+        if (-not (Test-Path -LiteralPath $libPath)) { continue }
+        if ((Get-Item -LiteralPath $libPath -Force).LinkType) { continue }
+        $dest = Join-Path $LibRoot $rel
+        $null = New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force
+        Write-Info "moving ~/Library/$rel"
+        try {
+            Invoke-Tool ditto @($libPath, $dest)
+            Invoke-Tool rm @('-rf', $libPath)
+        } catch {
+            Write-Caution "could not move ~/Library/${rel}: $_"
+            $null = Invoke-Tool rm @('-rf', $dest) -Tolerant
+            continue
+        }
+        $null = New-Item -ItemType SymbolicLink -Path $libPath -Target $dest
+        $moved++
+    }
+    return $moved
+}
+
+function Invoke-LibraryRestore {
+    # Reverse of Invoke-LibraryMove: walk the app's folder under the volume's
+    # App Library root and move each entry back to its ~/Library location,
+    # replacing the symlinks left there. Real entries at home are never clobbered.
+    # Returns the number of entries restored.
+    param(
+        [Parameter(Mandatory)] [string]$AppName,
+        [Parameter(Mandatory)] [string]$LibRoot
+    )
+    if (-not (Test-Path -LiteralPath $LibRoot)) { return 0 }
+    $restored = 0
+    foreach ($group in @(Get-ChildItem -LiteralPath $LibRoot -Directory)) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $group.FullName)) {
+            $homePath = Join-Path "$HOME/Library/$($group.Name)" $item.Name
+            $existing = Get-Item -LiteralPath $homePath -Force -ErrorAction SilentlyContinue
+            if ($existing) {
+                if ($existing.LinkType -eq 'SymbolicLink') {
+                    Remove-Item -LiteralPath $homePath -Force
+                } else {
+                    Write-Caution "keeping ~/Library/$($group.Name)/$($item.Name) - a real entry replaced the symlink"
+                    continue
+                }
+            }
+            $null = New-Item -ItemType Directory -Path (Split-Path $homePath -Parent) -Force
+            try {
+                Invoke-Tool mv @($item.FullName, $homePath)
+            } catch {
+                Write-Caution "could not restore ~/Library/$($group.Name)/$($item.Name): $_"
+                continue
+            }
+            $restored++
+        }
+        if (-not (Get-ChildItem -LiteralPath $group.FullName -Force)) { Remove-Item -LiteralPath $group.FullName -Force }
+    }
+    if (-not (Get-ChildItem -LiteralPath $LibRoot -Force)) { Remove-Item -LiteralPath $LibRoot -Force }
+    return $restored
+}
+
+function Invoke-BundleMove {
+    # Move one resolved, pre-checked bundle into DestDir and symlink it back.
+    # Returns $true on success; reports its own failures.
+    param(
+        [Parameter(Mandatory)] [string]$Src,
+        [Parameter(Mandatory)] [string]$DestDir
+    )
+    $appFile = Split-Path $Src -Leaf
+    $destParent = Split-Path $DestDir -Parent
     if (-not (Test-Path -LiteralPath $destParent)) {
         Write-Failure "destination drive is not mounted: $destParent"
-        exit 1
+        return $false
     }
-    $null = New-Item -ItemType Directory -Path $destDir -Force
-    $dst = Join-Path $destDir $appFile
+    $null = New-Item -ItemType Directory -Path $DestDir -Force
+    $dst = Join-Path $DestDir $appFile
 
     if (Test-Path -LiteralPath $dst) {
         if ($Force) {
@@ -309,39 +547,39 @@ function Invoke-Move {
             Remove-Item -LiteralPath $dst -Recurse -Force
         } else {
             Write-Failure "destination already exists: $dst (re-run with -Force to overwrite)"
-            exit 1
+            return $false
         }
     }
 
-    Write-Info "moving $src"
+    Write-Info "moving $Src"
     Write-Info "   to $dst"
-    Write-Info "symlink back at $src"
+    Write-Info "symlink back at $Src"
 
     # ditto preserves bundle structure, metadata, extended attributes, and forks
     Write-Info 'copying the bundle with ditto...'
     try {
-        Invoke-Tool ditto @($src, $dst)
+        Invoke-Tool ditto @($Src, $dst)
     } catch {
         Write-Failure "ditto copy failed: $_"
-        exit 1
+        return $false
     }
 
     Write-Info 'removing the original...'
     try {
-        Invoke-Tool rm @('-rf', $src)
+        Invoke-Tool rm @('-rf', $Src)
     } catch {
         Write-Caution 'plain removal failed - retrying with sudo (password may be asked)...'
         try {
-            Invoke-Tool sudo @('rm', '-rf', $src)
+            Invoke-Tool sudo @('rm', '-rf', $Src)
         } catch {
             Write-Failure "could not remove the original: $_"
             $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
             Write-Caution "rolled back the copy at $dst"
-            exit 1
+            return $false
         }
     }
 
-    $null = New-Item -ItemType SymbolicLink -Path $src -Target $dst
+    $null = New-Item -ItemType SymbolicLink -Path $Src -Target $dst
 
     # clear quarantine and re-sign so Gatekeeper accepts the relocated bundle
     Write-Info 'clearing extended attributes and re-signing...'
@@ -351,7 +589,95 @@ function Invoke-Move {
     Write-Info 're-registering with LaunchServices...'
     $null = Invoke-Tool $LsRegister @('-f', $dst) -Tolerant
 
-    Write-Info "moved $appFile to $dst"
+    # relocate the app's ~/Library footprint next to the bundle on the volume
+    $name = $appFile -replace '\.app$', ''
+    $libRoot = Join-Path (Split-Path $DestDir -Parent) "App Library/$name"
+    $libMoved = Invoke-LibraryMove -AppName $name -BundlePath $Src -LibRoot $libRoot
+
+    Write-Info "moved $appFile to $dst$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')"
+    return $true
+}
+
+function Invoke-MoveBatch {
+    # move with no app given: multiselect across every installed app, then one
+    # destination for all. Caution and avoid apps show up locked.
+    if ([Console]::IsInputRedirected) {
+        Write-Failure 'no app given and stdin is not interactive - pass an app name and destination, or run in a terminal.'
+        exit 2
+    }
+    $installed = @(Get-InstalledApp)
+    if ($installed.Count -eq 0) {
+        Write-Info 'no installed apps found in the search dirs.'
+        return
+    }
+    $tierOrder = @{ safe = 0; unlisted = 1; caution = 2; avoid = 3 }
+    $rawOptions = foreach ($app in $installed) {
+        $tier = Get-MoveTier $app
+        [pscustomobject]@{
+            Name   = $app
+            Tier   = $tier
+            Locked = $tier -in 'caution', 'avoid'
+            Note   = switch ($tier) {
+                'safe'    { 'safe' }
+                'caution' { 'caution - locked' }
+                'avoid'   { 'do not move - locked' }
+                default   { 'unlisted' }
+            }
+        }
+    }
+    $options = @($rawOptions | Sort-Object { $tierOrder[$_.Tier] }, Name)
+    if (-not ($options | Where-Object { -not $_.Locked })) {
+        Write-Info 'every installed app is on the caution or do-not-move list - nothing can be moved.'
+        return
+    }
+
+    $chosenNames = Read-MultiChoice -Options $options -Title 'Select apps to move'
+    if ($null -eq $chosenNames) {
+        Write-Info 'cancelled.'
+        return
+    }
+    if ($chosenNames.Count -eq 0) {
+        Write-Info 'nothing selected.'
+        return
+    }
+
+    $destDir = if ($Destination) { $Destination } else { Read-Destination }
+    $moved = 0
+    $failed = 0
+    $skipped = 0
+    foreach ($name in $chosenNames) {
+        $src = Resolve-AppBundle "$name.app"
+        if (-not $src -or -not (Test-AppReadyToMove $src)) { $skipped++; continue }
+        if (Invoke-BundleMove $src $destDir) { $moved++ } else { $failed++ }
+    }
+
+    Write-Host ''
+    Write-Info "moved $moved app(s) to $destDir - skipped $skipped, failed $failed."
+    if ($moved -gt 0) {
+        Write-Host 'Next steps:'
+        Write-Host '  - refresh caches:  pwsh -File ./mac-move-apps.ps1 refresh <app>'
+        Write-Host '  - undo everything: pwsh -File ./mac-move-apps.ps1 restore'
+    }
+    if ($failed -gt 0 -and $moved -eq 0) { exit 1 }
+}
+
+function Invoke-Move {
+    if (-not $AppName) { Invoke-MoveBatch; return }
+    $appFile = Resolve-AppName $AppName
+    $name = $appFile -replace '\.app$', ''
+    $src = Resolve-AppBundle $appFile
+    if (-not $src) {
+        Write-Failure "app not found in $($SearchDirs -join ' or '): $appFile"
+        exit 1
+    }
+    $tier = Get-MoveTier $name
+    if ($tier -in 'caution', 'avoid') {
+        Write-Failure "$name is on the $tier list - moving it is disabled."
+        exit 1
+    }
+    if (-not (Test-AppReadyToMove $src)) { exit 1 }
+    $destDir = if ($Destination) { $Destination } else { Read-Destination }
+    if (-not (Invoke-BundleMove $src $destDir)) { exit 1 }
     Write-Host ''
     Write-Host 'Next steps:'
     Write-Host "  - refresh caches:  pwsh -File ./mac-move-apps.ps1 refresh $appFile"
@@ -391,11 +717,11 @@ function Invoke-Restore {
             $failed++
             continue
         }
+        $bundleOk = $false
         try {
             Remove-Item -LiteralPath $app.LinkPath
             Invoke-Tool mv @($app.Target, $app.LinkPath)
-            Write-Host 'done'
-            $restored++
+            $bundleOk = $true
         } catch {
             Write-Host 'failed'
             Write-Caution "  could not restore $($app.Name): $_"
@@ -404,6 +730,19 @@ function Invoke-Restore {
                 $null = New-Item -ItemType SymbolicLink -Path $app.LinkPath -Target $app.Target
             }
             $failed++
+        }
+        if ($bundleOk) {
+            # bring the app's ~/Library entries back from the volume's App Library;
+            # a library failure never fails the restored bundle itself
+            $libRoot = Join-Path (Split-Path (Split-Path $app.Target -Parent) -Parent) "App Library/$($app.Name)"
+            $libRestored = 0
+            try {
+                $libRestored = Invoke-LibraryRestore -AppName $app.Name -LibRoot $libRoot
+            } catch {
+                Write-Caution "  could not restore ~/Library entries for $($app.Name): $_"
+            }
+            Write-Host "done$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')"
+            $restored++
         }
     }
 
