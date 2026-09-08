@@ -1,135 +1,67 @@
-# mac-move-apps
+# Mac Move Apps
 
-[![macOS](https://img.shields.io/badge/macOS-12%2B-blue)](https://www.apple.com/macos/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Move macOS `.app` bundles to external storage and back, keeping them fully launchable via symlinks — for when the internal SSD is full but Launchpad, Spotlight, and the Dock should keep working as before.
 
-Move macOS `.app` bundles to an external drive safely while keeping them fully functional via symlinks.
+One PowerShell command wraps the whole workflow. Derived from [cnshsliu/mac-move-apps](https://github.com/cnshsliu/mac-move-apps) (MIT), rewritten and modernised.
 
-This tool is especially useful when your internal SSD is running out of space but you still want apps to appear in Launchpad, Spotlight, and the Dock normally.
+## Requirements
 
-## Features
-
-- Move any app from `/Applications` or `~/Applications` to external storage
-- Automatically creates a symlink back to the original location
-- Supports both argument orders: `app-name path` or `path app-name`
-- `--list`: Shows currently installed apps categorized by safety
-- `--refresh`: Refresh LaunchServices, Dock, and Spotlight cache after moving
-- `--force`: Overwrite existing target if needed
-- Companion script `restoreapps.sh` to move everything back in one go
-- Automatic fallback to `sudo` when deleting protected apps
-- Common app name aliases supported (`VS Code`, `微信`, `iina`, etc.)
-
-## Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/cnshsliu/mac-move-apps.git
-cd mac-move-apps
-
-# Make scripts executable
-chmod +x moveapp.sh restoreapps.sh
-
-# (Optional) Install to ~/bin
-mkdir -p ~/bin
-cp moveapp.sh restoreapps.sh ~/bin/
-```
-
-Or simply download the scripts directly and place them in your `PATH`.
+- macOS 12+
+- [PowerShell 7.6+](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-macos) (`pwsh`) — the `#Requires -Version 7.6` guard fails fast on older hosts
+- `ditto`, `xattr`, `codesign` — all built into macOS
+- Admin rights when the app in `/Applications` needs `sudo` to remove
 
 ## Usage
 
-### Basic Move
-
-```bash
-# Recommended order
-moveapp.sh "Visual Studio Code" /Volumes/MySSD/Applications
-
-# Alternative order (path first)
-moveapp.sh /Volumes/MySSD/Applications "Visual Studio Code"
+```powershell
+pwsh -File ./mac-move-apps.ps1 move 'Visual Studio Code'                                # asks where the app should go
+pwsh -File ./mac-move-apps.ps1 move Motrix /Volumes/Scratchpad/Applications             # destination given
+pwsh -File ./mac-move-apps.ps1 list                                                     # what is safe to move
+pwsh -File ./mac-move-apps.ps1 status                                                   # what has been moved
+pwsh -File ./mac-move-apps.ps1 restore -DryRun                                          # preview moving everything back
+pwsh -File ./mac-move-apps.ps1 refresh IINA -ForceRepair                                # re-register a moved app
 ```
 
-### List Safe-to-Move Apps
+| Command | What it does |
+| --- | --- |
+| `move <app> [destination]` | Copies the bundle with `ditto`, replaces the original with a symlink, clears quarantine, ad-hoc re-signs, re-registers with LaunchServices. |
+| `restore` | Moves every externally-stored app back to its original location on the internal disk. |
+| `list` | Shows installed apps categorised by move safety. |
+| `status` | Shows apps already moved (symlinks targeting `/Volumes`). |
+| `refresh <app>` | Refreshes LaunchServices, Dock, Finder, and Spotlight for a moved app. |
 
-```bash
-moveapp.sh --list
-```
+Options: `-Force` (move: overwrite an existing target), `-DryRun` (restore: preview only), `-Yes` (restore: skip the prompt), `-ForceRepair` (refresh: also clear xattrs and re-sign).
 
-This shows all installed apps categorized into:
+App names accept aliases (`vscode`, `chrome`, `iterm2`, …), an optional `.app` suffix, or a direct bundle path. Apps are searched in `/Applications` and `~/Applications`.
 
-- **Recommended** (pure GUI apps with no system extensions)
-- **Caution** (may need testing after moving)
-- **Not Recommended** (Adobe apps, virtualization software, VPNs, etc.)
+When `move` gets no destination it asks where the app should go, listing mounted volumes with size and free space — pick a number (apps land in that volume's `Applications` dir) or type any destination path. Apps whose drive is unmounted simply fail to launch until it is remounted.
 
-### Refresh After Moving
+## What not to move
 
-```bash
-moveapp.sh --refresh "Visual Studio Code"
-```
+Adobe suites, Xcode, Parallels/VMware/OrbStack/Docker, VPNs (Tailscale, ExpressVPN), and anything with privileged helpers or system extensions — these integrate too deeply with the OS and break when relocated. `list` categorises what you have installed. Large apps on a mechanical external HDD will also feel sluggish — prefer a fast SSD.
 
-Or with forced repair:
+## How it works
 
-```bash
-moveapp.sh --refresh "IINA" --force-repair
-```
+1. `ditto` copies the entire bundle, preserving metadata, extended attributes, and resource forks.
+2. The original is removed (falling back to `sudo`, rolling back the copy if even that fails).
+3. A symlink takes the original's place, so macOS keeps seeing the app at its old path.
+4. `xattr -cr` clears quarantine and `codesign` ad-hoc re-signs, so Gatekeeper accepts the relocated bundle.
+5. `lsregister` re-registers the app; `restore` rebuilds LaunchServices and restarts Dock and Finder.
 
-### Force Overwrite
+## Credits
 
-```bash
-moveapp.sh --force /Volumes/MySSD/Applications "SomeApp"
-```
+Derived from [cnshsliu/mac-move-apps](https://github.com/cnshsliu/mac-move-apps), originally MIT licensed.
 
-### Restore All Apps
-
-```bash
-restoreapps.sh --dry-run     # Preview what will be restored
-restoreapps.sh               # Interactive restore
-restoreapps.sh --yes         # Restore everything without confirmation
-```
-
-## Important Notes
-
-### Apps That Should NOT Be Moved
-
-- **Adobe Creative Cloud apps** (Audition, Premiere, Photoshop, etc.)
-- **Xcode**
-- **Parallels Desktop**, **VMware Fusion**, **OrbStack**, **Docker**
-- **Tailscale**, **ExpressVPN**, **Clash Verge**
-- **Karabiner-Elements**
-- Any app that installs system extensions or privileged helpers
-
-These apps have deep system integration and moving them often breaks functionality.
-
-### Performance Considerations
-
-Even if an app can be moved, running large apps (especially video/audio editors) from a mechanical external HDD will result in noticeable lag. Use a fast external SSD (Thunderbolt or USB 3.2+) for best results.
-
-### Requirements
-
-- macOS 12+
-- `ditto`, `codesign`, `xattr` (all built-in)
-- Admin rights (for moving apps out of `/Applications`)
-
-## How It Works
-
-1. `ditto` is used to copy the entire `.app` bundle (preserves metadata and extended attributes).
-2. The original is removed (with `sudo` fallback if needed).
-3. A symlink is created in the original location pointing to the external copy.
-4. `lsregister` + Dock restart refreshes all system caches.
-
-Because of the symlink, macOS, Spotlight, and Launchpad continue to see the app at its original path.
+<!-- LICENSE/ -->
 
 ## License
 
-MIT License — feel free to use, modify, and share.
+Unless stated otherwise all works are:
 
-## Contributing
+- Copyright &copy; [Benjamin Lupton](https://balupton.com)
 
-Issues and pull requests are welcome! Especially for:
+and licensed under:
 
-- Adding more app aliases
-- Improving the safe-app detection logic
-- Supporting more languages in output messages
+- [Reciprocal Public License 1.5](http://spdx.org/licenses/RPL-1.5.html)
 
----
-
-Made for people who constantly fight with "Your disk is almost full" on modern Macs.
+<!-- /LICENSE -->
