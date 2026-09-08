@@ -27,9 +27,9 @@ The script has a `pwsh` shebang — `chmod +x ./mac-move-apps.ps1` once, then `.
 
 | Command | What it does |
 | --- | --- |
-| `move [app] [destination]` | Copies the bundle with `ditto`, replaces the original with a symlink, clears quarantine, ad-hoc re-signs, re-registers with LaunchServices — and relocates the app's `~/Library` footprint (Application Support, Caches, Logs, WebKit, HTTPStorages, Saved Application State) to the volume's `App Library` folder, symlinking those back too. With no app given, an arrow-key multiselect lists every installed app. |
+| `move [app] [destination]` | Copies the bundle with `ditto`, replaces the original with a symlink, clears quarantine, ad-hoc re-signs, re-registers with LaunchServices — and relocates the app's `~/Library` footprint (Application Support, Caches, Logs, WebKit, HTTPStorages, Saved Application State) to the volume's `App Library` folder, symlinking those back too. With no app given, a full-height multiselect lists every installed app: tier-coloured rows (green = safe, yellow = caution, red = do-not-move, cyan = unclassified), each showing the app's size and the exact paths a move would relocate underneath, with a live selected-total footer. |
 | `restore` | Moves every externally-stored app — and its `~/Library` entries — back to its original location on the internal disk. |
-| `list` | Shows installed apps categorised by move safety. |
+| `list` | Shows installed apps categorised by move safety, tier-coloured, with per-app sizes, section totals, and a movable grand total. |
 | `status` | Shows apps already moved (symlinks targeting `/Volumes`). |
 | `refresh <app>` | Refreshes LaunchServices, Dock, Finder, and Spotlight for a moved app. |
 

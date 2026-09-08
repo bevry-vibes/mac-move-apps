@@ -13,13 +13,16 @@
                                  The app's ~/Library footprint (Application Support,
                                  Caches, Logs, WebKit, HTTPStorages, Saved Application
                                  State) moves to the volume's 'App Library' folder too,
-                                 symlinked back. With no app given, an interactive
-                                 multiselect lists every installed app. When the
-                                 destination is omitted, the command asks where the
-                                 app should go, offering mounted volumes.
+                                 symlinked back. With no app given, a full-height
+                                 interactive multiselect lists every installed app
+                                 with tier colours, sizes, the paths a move would
+                                 relocate, and a live selected-total footer.
+                                 When the destination is omitted, the command asks
+                                 where the app should go, offering mounted volumes.
       restore                    Move every externally-stored app - and its ~/Library
                                  entries - back to the internal disk.
-      list                       Show installed apps categorised by how safe they are to move.
+      list                       Show installed apps categorised by how safe they
+                                 are to move, with sizes and totals.
       status                     Show apps already moved to external storage.
       refresh <app>              Re-register an app with LaunchServices and refresh
                                  Dock, Finder, and Spotlight; -ForceRepair also
@@ -99,37 +102,49 @@ $AppAliases = @{
 #   safe    - self-contained GUI apps with no system integration.
 $MoveTiers = [ordered]@{
     safe = @(
-        '0 A.D.', 'Aural', 'Amazon Kindle', 'Android Studio', 'AnythingLLM', 'Audacity',
-        'balenaEtcher', 'Beeper Desktop', 'Bible', 'Blender', 'Brave Browser', 'BusyCal',
-        'BusyContacts', 'Byword', 'calibre', 'ChatGPT', 'Claude', 'DBeaver', 'Discord',
-        'draw.io', 'Duplicate File Finder', 'eero', 'Endel', 'Firefox', 'Flighty',
-        'FreeCAD', 'GIMP', 'GitHub Copilot', 'GitHub Desktop', 'GoPro Player',
-        'Google Chrome', 'Hidden Bar', 'IINA', 'Inkscape', 'Jellyfin', 'Kagi Search',
-        'Kamusku', 'KeepingYouAwake', 'KeyCastr', 'keyviz', 'Lapce', 'Libation',
-        'LocalSend', 'Microsoft Edge', 'MongoDB Compass', 'Motrix', 'Numi',
-        'ONLYOFFICE', 'Open WebUI', 'OpenAudible', 'Orion', 'PDFgear', 'Pearcleaner',
-        'Plex', 'Plexamp', 'Prologue', 'Proton Meet', 'Readest', 'Revu',
-        'Script Debugger', 'Shazam', 'Shop', 'Shortcut Remote', 'Signal', 'Sketch',
-        'Sorted³', 'SpotiFLAC-Next', 'SQLiteo', 'Super Productivity', 'Telegram',
-        'Thunderbird', 'Tor Browser', 'Vivaldi', 'Visual Studio Code', 'Waterfox',
-        'WhatsApp', 'ZCode', 'Zed'
+        '0 A.D.', 'ABDownloadManager', 'Actions', 'Amazon Kindle', 'Android Studio',
+        'AnythingLLM', 'Aural', 'Audacity', 'balenaEtcher', 'Beeper Desktop', 'Bible',
+        'Blender', 'Brave Browser', 'BusyCal', 'BusyContacts', 'Byword', 'calibre',
+        'ChatGPT', 'Claude', 'DBeaver', 'Discord', 'draw.io', 'Duplicate File Finder',
+        'eero', 'Endel', 'Firefox', 'Flighty', 'FreeCAD', 'GIMP', 'GitHub Copilot',
+        'GitHub Desktop', 'GoPro Player', 'Google Chrome', 'Hidden Bar', 'IINA',
+        'Insta360 Studio', 'Inkscape', 'Jellyfin', 'Kagi Search', 'Kamusku',
+        'KeepingYouAwake', 'KeyCastr', 'keyviz', 'Lapce', 'Libation', 'LocalSend',
+        'Menu Bar Controller for Sonos 2', 'Meta', 'Microsoft Edge', 'Mole',
+        'MongoDB Compass', 'Motrix', 'mux', 'Numi', 'ONLYOFFICE', 'Open WebUI',
+        'OpenAudible', 'Openscreen', 'Orion', 'PDFgear', 'Pearcleaner', 'Plezy',
+        'Plex', 'Plexamp', 'Prologue', 'Proton Mail Uninstaller', 'Proton Meet',
+        'Quiet', 'Radix', 'Readest', 'Revu', 'Script Debugger', 'Shazam', 'Shop',
+        'Shortcut Remote', 'Signal', 'Sketch', 'Sorted³', 'SpotiFLAC-Next',
+        'SQLiteo', 'Super Productivity', 'Telegram', 'Thunderbird', 'Tolaria',
+        'tribler-8.4.3-arm', 'Tor Browser', 'Vivaldi', 'Visual Studio Code',
+        'Waterfox', 'WhatsApp', 'ZCode', 'Zed'
     )
     caution = @(
-        '1Password', 'Alfred 5', 'Android File Transfer', 'Elgato Camera Hub',
-        'Elgato Capture Device Utility', 'Elgato Control Center', 'Elgato Stream Deck',
-        'Elgato Studio', 'Ghostty', 'Hammerspoon', 'iTerm', 'Karabiner-EventViewer',
-        'Keynote', 'LG Screen Manager', 'Microsoft Excel', 'Microsoft PowerPoint',
-        'Microsoft Word', 'Numbers', 'OBS', 'Ollama', 'Pages', 'QuickLook Video',
-        'Routine Screenshot', 'Swish', 'Toggle Office Lights', 'UI Browser', 'Vidimote',
-        'Wox', 'zoom.us'
+        '1Password', 'Alfred 5', 'Android File Transfer', 'Choosy', 'Data Jar',
+        'Elgato Camera Hub', 'Elgato Capture Device Utility', 'Elgato Control Center',
+        'Elgato Stream Deck', 'Elgato Studio', 'Ghostty', 'Hammerspoon', 'iTerm',
+        'Karabiner-EventViewer', 'Keynote', 'LG Screen Manager', 'Microsoft Excel',
+        'Microsoft PowerPoint', 'Microsoft Word', 'Numbers', 'OBS', 'Ollama', 'Pages',
+        'QuickLook Video', 'Routine Screenshot', 'Swish', 'TestFlight',
+        'Toggle Office Lights', 'UI Browser', 'Vidimote', 'Wox', 'zoom.us'
     )
     avoid = @(
         'Adguard', 'Audio Hijack', 'Backblaze', 'BackblazeRestore', 'Compressor',
-        'DaVinci Resolve', 'Docker', 'ExpressVPN', 'Final Cut Pro', 'iMovie',
-        'Karabiner-Elements', 'lghub', 'Loopback', 'OpenCore-Patcher', 'OrbStack',
-        'Parallels Desktop', 'Plex Media Server', 'RustDesk', 'Safari', 'SoundSource',
-        'Syncthing', 'Tailscale', 'VMware Fusion', 'Xcode'
+        'Compressor Creator Studio', 'DaVinci Resolve', 'Docker', 'ExpressVPN',
+        'Final Cut Pro', 'iMovie', 'Karabiner-Elements', 'lghub', 'Loopback',
+        'OpenCore-Patcher', 'OrbStack', 'Parallels Desktop', 'Plex Media Server',
+        'RustDesk', 'Safari', 'SoundSource', 'Syncthing', 'Tailscale',
+        'VMware Fusion', 'Xcode'
     )
+}
+
+# Terminal colour per tier, shared by the multiselect and the list output.
+$TierColors = @{
+    safe     = $PSStyle.Foreground.Green
+    caution  = $PSStyle.Foreground.Yellow
+    avoid    = $PSStyle.Foreground.Red
+    unlisted = $PSStyle.Foreground.Cyan
 }
 
 function Get-MoveTier {
@@ -184,11 +199,11 @@ function Resolve-AppBundle {
 }
 
 function Get-InstalledApp {
-    # Bundle names sitting in the search dirs; apps already symlinked elsewhere are skipped.
+    # Bundles sitting in the search dirs; apps already symlinked elsewhere are skipped.
     foreach ($dir in $SearchDirs) {
         if (-not (Test-Path -LiteralPath $dir)) { continue }
         Get-ChildItem -LiteralPath $dir -Filter *.app -Directory | Where-Object { -not $_.LinkType } |
-            ForEach-Object { $_.Name -replace '\.app$', '' }
+            ForEach-Object { [pscustomobject]@{ Name = $_.Name -replace '\.app$', ''; Path = $_.FullName } }
     }
 }
 
@@ -294,30 +309,40 @@ Exit codes: 0 = success, 1 = failure, 2 = usage error.
 }
 
 function Show-MovableList {
-    $installed = @(Get-InstalledApp)
+    Write-Info 'measuring apps...'
+    $apps = @(Get-AppInventory)
+    if ($apps.Count -eq 0) {
+        Write-Info 'no installed apps found in the search dirs.'
+        return
+    }
     $sections = [ordered]@{
-        safe    = 'Safe to move - pure GUI apps, no system extensions'
-        caution = 'Move with caution - test after moving'
-        avoid   = 'Do not move - system extensions, virtualisation, VPNs, deep system integration'
+        safe     = 'Safe to move - pure GUI apps, no system extensions'
+        caution  = 'Move with caution - locked (integration keys to the install path)'
+        avoid    = 'Do not move - locked (drivers, extensions, root helpers, launchd services)'
+        unlisted = 'Unclassified - review before moving'
     }
-    $colors = @{
-        safe    = $PSStyle.Foreground.Green
-        caution = $PSStyle.Foreground.Yellow
-        avoid   = $PSStyle.Foreground.Red
-    }
+    $grandKb = 0
+    $grandCount = 0
     foreach ($tier in $sections.Keys) {
         Write-Host ''
-        Write-Host "$($colors[$tier])$($sections[$tier])$($PSStyle.Reset)"
-        $hits = @($MoveTiers[$tier] | Where-Object { $installed -contains $_ })
+        Write-Host "$($TierColors[$tier])$($sections[$tier])$($PSStyle.Reset)"
+        $hits = @($apps | Where-Object Tier -eq $tier)
         if ($hits.Count -eq 0) {
             Write-Host '  (none installed)'
-        } else {
-            foreach ($app in $hits) { Write-Host "  - $app" }
+            continue
         }
+        $sectionKb = 0
+        foreach ($app in $hits) {
+            Write-Host "  $($TierColors[$tier])- $($app.Name)$($PSStyle.Reset)$($PSStyle.Dim)  $(Format-Size $app.SizeKb)$($PSStyle.Reset)"
+            $sectionKb += $app.SizeKb
+        }
+        Write-Host "$($PSStyle.Dim)  section: $($hits.Count) app(s), $(Format-Size $sectionKb)$($PSStyle.Reset)"
+        if ($tier -in 'safe', 'unlisted') { $grandKb += $sectionKb; $grandCount += $hits.Count }
     }
     Write-Host ''
-    Write-Host 'Caution and avoid apps cannot be moved; safe apps are recommended.'
-    Write-Host 'Unlisted apps: use your judgement - anything with privileged helpers,'
+    Write-Host "$($PSStyle.Bold)selectable (safe + unclassified): $grandCount app(s), $(Format-Size $grandKb)$($PSStyle.Reset)"
+    Write-Host 'Caution and avoid apps are locked and cannot be moved; safe apps are recommended.'
+    Write-Host 'Unclassified apps: review before moving - anything with privileged helpers,'
     Write-Host 'system extensions, or an updater that checks its own path stays put.'
 }
 
@@ -332,10 +357,12 @@ function Show-Status {
 }
 
 function Read-MultiChoice {
-    # Arrow-key multiselect over Options (Name, Note, Locked), following the input
-    # pattern of bevry-vibes menu.ps1: typed key comparisons, Ctrl+C captured as an
-    # ordinary key, in-place redraw, console state restored in finally. Locked
-    # entries render dimmed and can be neither focused nor toggled. Returns the
+    # Full-height arrow-key multiselect, following the input pattern of
+    # bevry-vibes menu.ps1: typed key comparisons, Ctrl+C captured as an ordinary
+    # key, in-place redraw, console state restored in finally. Each entry renders
+    # as a tier-coloured headline (name, size, status) with the paths a move
+    # would relocate listed dimly underneath; locked entries stay single-line.
+    # The footer's selected count and total update on every toggle. Returns the
     # chosen names (empty = confirmed nothing), or $null when cancelled/aborted.
     param(
         [Parameter(Mandatory)] [pscustomobject[]]$Options,
@@ -347,9 +374,7 @@ function Read-MultiChoice {
     $chosen = [System.Collections.Generic.HashSet[int]]::new()
     $cursor = 0
     $top = 0
-    $visible = [Math]::Min($Options.Count, 12)
-    $lastCount = 0
-    $firstDraw = $true
+    $maxPathLines = 4
     $esc = [char]27
     $reset = $PSStyle.Reset
     $dim = $PSStyle.Dim
@@ -357,36 +382,79 @@ function Read-MultiChoice {
     $bold = $PSStyle.Bold
     $previousTreatControlC = [Console]::TreatControlCAsInput
 
+    $lineCount = {
+        # headline + path preview lines (+ an overflow line) per entry
+        param([pscustomobject]$Opt)
+        if ($Opt.Locked) { return 1 }
+        $pathLines = [Math]::Min($Opt.Paths.Count, $maxPathLines)
+        $more = ($Opt.Paths.Count -gt $maxPathLines) ? 1 : 0
+        return 1 + $pathLines + $more
+    }
+
+    $headerLines = 3   # blank + title + locked note, written once below
     Write-Host ''
     Write-Host "$bold$Title$reset"
-    Write-Host 'up/down or j/k move · space toggle · a all · n none · enter confirm · q or esc cancel'
-    Write-Host 'Locked entries (caution / do-not-move) cannot be selected.'
+    Write-Host "$dim locked entries (caution / do-not-move) cannot be selected.$reset"
 
+    $shown = @()
+    $lastDrawn = 0
+    $firstDraw = $true
     try {
         [Console]::TreatControlCAsInput = $true
         # CursorVisible's getter throws on macOS, so save nothing and just restore
         [Console]::CursorVisible = $false
         while ($true) {
-            if ($cursor -lt $top) { $top = $cursor }
-            if ($cursor -ge $top + $visible) { $top = $cursor - $visible + 1 }
-            if ($Options.Count -gt $visible) { $top = [Math]::Min($top, $Options.Count - $visible) }
-            $lines = @()
-            if ($top -gt 0) { $lines += "$dim  …$reset" }
-            for ($i = $top; $i -lt [Math]::Min($top + $visible, $Options.Count); $i++) {
+            # fill the window: header + footer + a one-line breathing margin
+            $budget = [Math]::Max([Console]::WindowHeight - $headerLines - 3, 3)
+            if ($focusIndex[$cursor] -lt $top) { $top = $focusIndex[$cursor] }
+
+            foreach ($attempt in @($top, $focusIndex[$cursor])) {
+                $shown = @()
+                $lines = 0
+                for ($i = $attempt; $i -lt $Options.Count; $i++) {
+                    $count = & $lineCount $Options[$i]
+                    if ($lines + $count -gt $budget -and $shown.Count -gt 0) { break }
+                    $shown += $i
+                    $lines += [Math]::Min($count, $budget - $lines)
+                }
+                if ($shown -contains $focusIndex[$cursor]) { $top = $attempt; break }
+                # the focused entry fell outside the window - restart from it
+            }
+
+            # footer: controls + live totals over the current selection
+            $selectedKb = 0
+            foreach ($i in $chosen) { $selectedKb += $Options[$i].SizeKb }
+            $footer = @(
+                "$dim up/down or j/k move · space toggle · a all · n none · enter confirm · q or esc cancel$reset"
+                "$bold$($chosen.Count) selected · $(Format-Size $selectedKb) will be moved$reset"
+            )
+
+            $out = @()
+            foreach ($i in $shown) {
                 $opt = $Options[$i]
+                $color = $TierColors[$opt.Tier]
                 if ($opt.Locked) {
-                    $lines += "$dim  [locked] $($opt.Name) - $($opt.Note)$reset"
-                } else {
-                    $box = $chosen.Contains($i) ? "$green[x]$reset" : '[ ]'
-                    $arrow = ($focusIndex[$cursor] -eq $i) ? "$bold>$reset " : '  '
-                    $lines += "$arrow$box $($opt.Name)$dim $($opt.Note)$reset"
+                    $out += "$dim  [locked] $($opt.Name)$reset$dim  $(Format-Size $opt.SizeKb)  $($opt.Note)$reset"
+                    continue
+                }
+                $box = $chosen.Contains($i) ? "$green[x]$reset" : '[ ]'
+                $arrow = ($focusIndex[$cursor] -eq $i) ? "$bold>$reset " : '  '
+                $out += "$arrow$box $color$($opt.Name)$reset$dim  $(Format-Size $opt.SizeKb)  $($opt.Note)$reset"
+                $paths = @($opt.Paths)
+                $take = [Math]::Min($paths.Count, $maxPathLines)
+                for ($p = 0; $p -lt $take -and $out.Count -lt $budget; $p++) {
+                    $short = $paths[$p] -replace [regex]::Escape($HOME), '~'
+                    $out += "$dim      $short$reset"
+                }
+                if ($paths.Count -gt $maxPathLines -and $out.Count -lt $budget) {
+                    $out += "$dim      … +$($paths.Count - $maxPathLines) more$reset"
                 }
             }
-            if ($top + $visible -lt $Options.Count) { $lines += "$dim  …$reset" }
-            if (-not $firstDraw) { [Console]::Write("$esc[$($lastCount)A") }
+
+            $lastDrawn = $out.Count + $footer.Count
+            if (-not $firstDraw) { [Console]::Write("$esc[$($lastDrawn)A") }
             $firstDraw = $false
-            foreach ($line in $lines) { [Console]::Write("$line$esc[K`r`n") }
-            $lastCount = $lines.Count
+            foreach ($line in $out + $footer) { [Console]::Write("$esc[2K$line`r`n") }
 
             $key = [Console]::ReadKey($true)
             if ($key.Key -eq [ConsoleKey]::Enter) { break }
@@ -447,6 +515,73 @@ function Get-AppBundleIdentifier {
     return "$id".Trim()
 }
 
+function Get-AppLibraryRelPath {
+    # The ~/Library-relative paths this tool relocates for an app: by bundle name,
+    # and by bundle identifier when one exists. Pure derivation - existence is the
+    # caller's concern - so the menu can show exactly what a move would relocate.
+    param(
+        [Parameter(Mandatory)] [string]$AppName,
+        [string]$BundleId = ''
+    )
+    $rel = @("Application Support/$AppName", "Logs/$AppName")
+    if ($BundleId) {
+        $rel += @(
+            "Application Support/$BundleId"
+            "Caches/$BundleId"
+            "Saved Application State/$BundleId.savedState"
+            "WebKit/$BundleId"
+            "HTTPStorages/$BundleId"
+        )
+    }
+    return $rel | Select-Object -Unique
+}
+
+function Get-AppRelocatable {
+    # Everything a move would take off the internal disk for one app: the bundle
+    # plus its still-local ~/Library entries (already-symlinked entries are
+    # already on a volume and are skipped). The menu sizes and previews these.
+    param([Parameter(Mandatory)] [string]$BundlePath)
+    $name = (Split-Path $BundlePath -Leaf) -replace '\.app$', ''
+    $paths = @($BundlePath)
+    $bundleId = Get-AppBundleIdentifier $BundlePath
+    foreach ($rel in (Get-AppLibraryRelPath -AppName $name -BundleId $bundleId)) {
+        $libPath = Join-Path "$HOME/Library" $rel
+        if (-not (Test-Path -LiteralPath $libPath)) { continue }
+        if ((Get-Item -LiteralPath $libPath -Force).LinkType) { continue }
+        $paths += $libPath
+    }
+    return $paths
+}
+
+function Format-Size {
+    # Human-readable size from du's 1 KiB units, so the byte-constant thresholds
+    # read as their KiB multiples: 1MB of KiB = 1 GiB, 1KB of KiB = 1 MiB.
+    param([Parameter(Mandatory)] [long]$SizeKb)
+    if ($SizeKb -ge 1MB) { return '{0:n1} GB' -f ($SizeKb / 1MB) }
+    if ($SizeKb -ge 1KB) { return '{0:n1} MB' -f ($SizeKb / 1KB) }
+    return "$SizeKb KB"
+}
+
+function Get-AppSize {
+    # Parallel du over each app's relocatable paths; returns a name-to-KiB hashtable.
+    # du reads only directory metadata, so even multi-GB bundles size in milliseconds.
+    param([Parameter(Mandatory)] [pscustomobject[]]$Apps)
+    if ($Apps.Count -eq 0) { return @{} }
+    # $LASTEXITCODE is not populated inside -Parallel runspaces, so success is
+    # judged from stdout alone: a bad path leaves du output empty (stderr suppressed)
+    $rows = $Apps | ForEach-Object -Parallel {
+        $kb = 0
+        foreach ($path in $_.Paths) {
+            $first = & du -sk $path 2>$null | Select-Object -First 1
+            if ("$first" -match '^(\d+)') { $kb += [long]$Matches[1] }
+        }
+        [pscustomobject]@{ Name = $_.Name; SizeKb = $kb }
+    } -ThrottleLimit 8
+    $sizes = @{}
+    foreach ($row in $rows) { $sizes[$row.Name] = $row.SizeKb }
+    return $sizes
+}
+
 function Invoke-LibraryMove {
     # Relocate the app's ~/Library footprint - the big stuff: Application Support,
     # Caches, Logs, WebKit, HTTPStorages, Saved Application State - to LibRoot,
@@ -459,16 +594,7 @@ function Invoke-LibraryMove {
         [Parameter(Mandatory)] [string]$LibRoot
     )
     $bundleId = Get-AppBundleIdentifier $BundlePath
-    $relPaths = @("Application Support/$AppName", "Logs/$AppName")
-    if ($bundleId) {
-        $relPaths += @(
-            "Application Support/$bundleId"
-            "Caches/$bundleId"
-            "Saved Application State/$bundleId.savedState"
-            "WebKit/$bundleId"
-            "HTTPStorages/$bundleId"
-        )
-    }
+    $relPaths = Get-AppLibraryRelPath -AppName $AppName -BundleId $bundleId
     $moved = 0
     foreach ($rel in ($relPaths | Select-Object -Unique)) {
         $libPath = Join-Path "$HOME/Library" $rel
@@ -639,6 +765,33 @@ function Invoke-BundleMove {
     return $true
 }
 
+function Get-AppInventory {
+    # Installed apps enriched with tier, relocatable paths, and sizes - the shared
+    # base for the multiselect and the list output, sorted safe → unlisted →
+    # caution → avoid, then by name. Empty when nothing is installed.
+    $installed = @(Get-InstalledApp)
+    if ($installed.Count -eq 0) { return @() }
+    $infos = foreach ($app in $installed) {
+        [pscustomobject]@{ Name = $app.Name; Path = $app.Path; Paths = @(Get-AppRelocatable $app.Path) }
+    }
+    $sizes = Get-AppSize $infos
+    $tierOrder = @{ safe = 0; unlisted = 1; caution = 2; avoid = 3 }
+    $notes = @{ caution = 'caution - locked'; avoid = 'do not move - locked'; unlisted = 'unlisted - review'; safe = 'safe' }
+    $rows = foreach ($info in $infos) {
+        $tier = Get-MoveTier $info.Name
+        [pscustomobject]@{
+            Name   = $info.Name
+            Path   = $info.Path
+            Tier   = $tier
+            Locked = $tier -in 'caution', 'avoid'
+            Note   = $notes[$tier]
+            Paths  = $info.Paths
+            SizeKb = $sizes[$info.Name]
+        }
+    }
+    return @($rows | Sort-Object { $tierOrder[$_.Tier] }, Name)
+}
+
 function Invoke-MoveBatch {
     # move with no app given: multiselect across every installed app, then one
     # destination for all. Caution and avoid apps show up locked.
@@ -646,27 +799,12 @@ function Invoke-MoveBatch {
         Write-Failure 'no app given and stdin is not interactive - pass an app name and destination, or run in a terminal.'
         exit 2
     }
-    $installed = @(Get-InstalledApp)
-    if ($installed.Count -eq 0) {
+    Write-Info 'measuring apps...'
+    $options = @(Get-AppInventory)
+    if ($options.Count -eq 0) {
         Write-Info 'no installed apps found in the search dirs.'
         return
     }
-    $tierOrder = @{ safe = 0; unlisted = 1; caution = 2; avoid = 3 }
-    $rawOptions = foreach ($app in $installed) {
-        $tier = Get-MoveTier $app
-        [pscustomobject]@{
-            Name   = $app
-            Tier   = $tier
-            Locked = $tier -in 'caution', 'avoid'
-            Note   = switch ($tier) {
-                'safe'    { 'safe' }
-                'caution' { 'caution - locked' }
-                'avoid'   { 'do not move - locked' }
-                default   { 'unlisted' }
-            }
-        }
-    }
-    $options = @($rawOptions | Sort-Object { $tierOrder[$_.Tier] }, Name)
     if (-not ($options | Where-Object { -not $_.Locked })) {
         Write-Info 'every installed app is on the caution or do-not-move list - nothing can be moved.'
         return
