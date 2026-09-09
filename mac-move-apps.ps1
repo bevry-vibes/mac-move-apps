@@ -196,6 +196,26 @@ function Invoke-Tool {
     return $output
 }
 
+function Invoke-Trash {
+    # Move paths to the macOS Trash with the built-in /usr/bin/trash (TRASH(8)).
+    # Internal-disk paths are effectively a rename, Finder-style collision
+    # naming applies, and the item stays recoverable until the Trash is emptied.
+    # Returns $true only when every path left its original location. Deletions
+    # of original user data go through here, never plain rm: a trashed item can
+    # be pulled back out.
+    param([Parameter(Mandatory)] [string[]]$Paths)
+    $trashArgs = @('-s') + $Paths
+    if (Test-Path -LiteralPath '/usr/bin/trash') {
+        $null = & /usr/bin/trash @trashArgs 2>$null
+    }
+    $failed = @($Paths | Where-Object { Test-Path -LiteralPath $_ })
+    if ($failed.Count -gt 0) {
+        Write-Caution "could not move to the Trash: $($failed -join ', ')"
+        return $false
+    }
+    return $true
+}
+
 function Resolve-AppName {
     # Map a short name to its canonical bundle name and ensure the .app suffix.
     param([Parameter(Mandatory)] [string]$Name)
@@ -894,22 +914,23 @@ function Invoke-LibraryMove {
             [void][System.IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
             Write-Info "moving ~/Library/$rel"
             Invoke-Tool ditto @($libPath, $dest)
-            # a Finder window or editor can race rm by dropping fresh files
-            # (.DS_Store) into the directory - "Directory not empty" - retry once
-            try {
-                Invoke-Tool rm @('-rf', $libPath)
-            } catch {
-                Write-Caution "first removal failed (close Finder windows/editors holding ~/Library/$rel) - retrying..."
+            # trash the original - recoverable, and a rename rather than a
+            # file-by-file walk, so nothing can race it mid-deletion; library
+            # data is irreplaceable, so a failed trash NEVER falls back to rm
+            if (-not (Invoke-Trash @($libPath))) {
+                Write-Caution 'first trash attempt failed - retrying once...'
                 Start-Sleep -Seconds 1
-                Invoke-Tool rm @('-rf', $libPath)
+                if (-not (Invoke-Trash @($libPath))) {
+                    throw "could not move ~/Library/$rel to the Trash"
+                }
             }
             Invoke-Tool ln @('-s', $dest, $libPath)
         } catch {
             # never delete the copy here: after a partial source removal it may
             # be the only complete copy left
             Write-Caution "could not finish moving ~/Library/${rel}: $_"
-            Write-Caution "kept the copy at $(($dest -replace [regex]::Escape($HOME), '~')) - to finish by hand once nothing holds the directory:"
-            Write-Caution "  rm -rf `"$libPath`" && ln -s `"$dest`" `"$libPath`""
+            Write-Caution "kept the copy at $(($dest -replace [regex]::Escape($HOME), '~')) - to finish by hand:"
+            Write-Caution "  move `"$libPath`" to the Trash (or rm -rf it), then: ln -s `"$dest`" `"$libPath`""
             $failed++
             continue
         }
@@ -1023,24 +1044,29 @@ function Invoke-BundleMove {
         Invoke-Tool ditto @($Src, $dst)
     } catch {
         Write-Failure "ditto copy failed: $_"
+        # plain rm on purpose: this is the partial copy WE just created on the
+        # destination volume (never user data, the original is intact), and
+        # trashing it would copy it back across volumes into ~/.Trash
         $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
         return $false
     }
 
-    Write-Info 'removing the original...'
-    try {
-        Invoke-Tool rm @('-rf', $Src)
-    } catch {
-        Write-Caution 'plain removal failed - retrying with sudo (password may be asked)...'
+    Write-Info 'removing the original (to the Trash)...'
+    if (-not (Invoke-Trash @($Src))) {
+        Write-Caution 'trash failed - falling back to rm (a bundle is re-downloadable; the volume copy is kept if this fails too)...'
         try {
-            Invoke-Tool sudo @('rm', '-rf', $Src)
+            Invoke-Tool rm @('-rf', $Src)
         } catch {
-            # the copy is never deleted here: a half-finished removal leaves the
-            # original damaged and the copy as the only complete version
-            Write-Failure "could not remove the original: $_"
-            Write-Caution "kept the copy at $dst - once nothing holds the original, finish by hand:"
-            Write-Caution "  rm -rf `"$Src`" && ln -s `"$dst`" `"$Src`""
-            return $false
+            Write-Caution 'plain removal failed - retrying with sudo (password may be asked)...'
+            try {
+                Invoke-Tool sudo @('rm', '-rf', $Src)
+            } catch {
+                # the copy is never deleted here: a half-finished removal leaves
+                # the original damaged and the copy as the only complete version
+                Write-Failure "could not remove the original: $_"
+                Write-Caution "kept the copy at $dst - move `"$Src`" to the Trash (or rm -rf it), then: ln -s `"$dst`" `"$Src`""
+                return $false
+            }
         }
     }
 

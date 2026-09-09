@@ -49,7 +49,7 @@ Adobe suites, Xcode, Parallels/VMware/OrbStack/Docker, VPNs (Tailscale, ExpressV
 ## How it works
 
 1. `ditto` copies the entire bundle, preserving metadata, extended attributes, and resource forks.
-2. The original is removed (falling back to `sudo`, rolling back the copy if even that fails).
+2. The original is moved to the Trash (built-in `/usr/bin/trash` — recoverable until you empty it; bundles fall back to `rm`/`sudo` if trashing fails, library data never does). If a removal cannot complete, the volume copy is always kept and the tool prints the exact steps to finish by hand — nothing is ever deleted to "roll back".
 3. A symlink takes the original's place, so macOS keeps seeing the app at its old path.
 4. The app's `~/Library` footprint moves to `<volume>/App Library/<app name>/` with symlinks back at each original location.
 5. `xattr -cr` clears quarantine and `codesign` ad-hoc re-signs, so Gatekeeper accepts the relocated bundle.
