@@ -43,7 +43,7 @@ The safety tiers are enforced, not advisory: apps on the caution and avoid lists
 
 ## What not to move
 
-Adobe suites, Xcode, Parallels/VMware/OrbStack/Docker, VPNs (Tailscale, ExpressVPN), and anything with privileged helpers or system extensions — these integrate too deeply with the OS and break when relocated. `list` categorises what you have installed. Large apps on a mechanical external HDD will also feel sluggish — prefer a fast SSD.
+Adobe suites, Xcode, Parallels/VMware/OrbStack/Docker, VPNs (Tailscale, ExpressVPN), and anything with privileged helpers or system extensions — these integrate too deeply with the OS and break when relocated. The **Mozilla family (Firefox, Thunderbird, Waterfox)** is also locked: Mozilla apps key their "dedicated default profile" to the app's real install path, so an app moved to another volume comes up as a fresh install with an empty profile (the old profile is still on disk and can be re-selected, but it's a trap this tool would rather not spring). `list` categorises what you have installed. Large apps on a mechanical external HDD will also feel sluggish — prefer a fast SSD.
 
 ## How it works
 

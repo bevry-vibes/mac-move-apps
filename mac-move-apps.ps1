@@ -98,7 +98,9 @@ $AppAliases = @{
 #             services; or patches the system (Apple pro media apps included).
 #   caution - relies on integration that references its install path or keys
 #             permissions to it (browser native messaging, accessibility/TCC grants,
-#             driver installers, App Store Apple apps, terminals).
+#             driver installers, App Store Apple apps, terminals, and the Mozilla
+#             family - Firefox, Thunderbird, Waterfox - whose profiles are keyed
+#             to the install path, so relocation looks like a fresh install).
 #   safe    - self-contained GUI apps with no system integration.
 $MoveTiers = [ordered]@{
     safe = @(
@@ -106,7 +108,7 @@ $MoveTiers = [ordered]@{
         'AnythingLLM', 'Aural', 'Audacity', 'balenaEtcher', 'Beeper Desktop', 'Bible',
         'Blender', 'Brave Browser', 'BusyCal', 'BusyContacts', 'Byword', 'calibre',
         'ChatGPT', 'Claude', 'DBeaver', 'Discord', 'draw.io', 'Duplicate File Finder',
-        'eero', 'Endel', 'Firefox', 'Flighty', 'FreeCAD', 'GIMP', 'GitHub Copilot',
+        'eero', 'Endel', 'Flighty', 'FreeCAD', 'GIMP', 'GitHub Copilot',
         'GitHub Desktop', 'GoPro Player', 'Google Chrome', 'Hidden Bar', 'IINA',
         'Insta360 Studio', 'Inkscape', 'Jellyfin', 'Kagi Search', 'Kamusku',
         'KeepingYouAwake', 'KeyCastr', 'keyviz', 'Lapce', 'Libation', 'LocalSend',
@@ -116,18 +118,19 @@ $MoveTiers = [ordered]@{
         'Plex', 'Plexamp', 'Prologue', 'Proton Mail Uninstaller', 'Proton Meet',
         'Quiet', 'Radix', 'Readest', 'Revu', 'Script Debugger', 'Shazam', 'Shop',
         'Shortcut Remote', 'Signal', 'Sketch', 'Sorted³', 'SpotiFLAC-Next',
-        'SQLiteo', 'Super Productivity', 'Telegram', 'Thunderbird', 'Tolaria',
+        'SQLiteo', 'Super Productivity', 'Telegram', 'Tolaria',
         'tribler-8.4.3-arm', 'Tor Browser', 'Vivaldi', 'Visual Studio Code',
-        'Waterfox', 'WhatsApp', 'ZCode', 'Zed'
+        'WhatsApp', 'ZCode', 'Zed'
     )
     caution = @(
         '1Password', 'Alfred 5', 'Android File Transfer', 'Choosy', 'Data Jar',
         'Elgato Camera Hub', 'Elgato Capture Device Utility', 'Elgato Control Center',
-        'Elgato Stream Deck', 'Elgato Studio', 'Ghostty', 'Hammerspoon', 'iTerm',
-        'Karabiner-EventViewer', 'Keynote', 'LG Screen Manager', 'Microsoft Excel',
-        'Microsoft PowerPoint', 'Microsoft Word', 'Numbers', 'OBS', 'Ollama', 'Pages',
-        'QuickLook Video', 'Routine Screenshot', 'Swish', 'TestFlight',
-        'Toggle Office Lights', 'UI Browser', 'Vidimote', 'Wox', 'zoom.us'
+        'Elgato Stream Deck', 'Elgato Studio', 'Firefox', 'Ghostty', 'Hammerspoon',
+        'iTerm', 'Karabiner-EventViewer', 'Keynote', 'LG Screen Manager',
+        'Microsoft Excel', 'Microsoft PowerPoint', 'Microsoft Word', 'Numbers',
+        'OBS', 'Ollama', 'Pages', 'QuickLook Video', 'Routine Screenshot', 'Swish',
+        'TestFlight', 'Thunderbird', 'Toggle Office Lights', 'UI Browser',
+        'Vidimote', 'Waterfox', 'Wox', 'zoom.us'
     )
     avoid = @(
         'Adguard', 'Audio Hijack', 'Backblaze', 'BackblazeRestore', 'Compressor',
@@ -516,14 +519,15 @@ function Get-AppBundleIdentifier {
 }
 
 function Get-AppLibraryRelPath {
-    # The ~/Library-relative paths this tool relocates for an app: by bundle name,
-    # and by bundle identifier when one exists. Pure derivation - existence is the
+    # The ~/Library-relative paths this tool relocates for an app: the top-level
+    # app-named dir (where Mozilla keeps Thunderbird's data), by bundle name, and
+    # by bundle identifier when one exists. Pure derivation - existence is the
     # caller's concern - so the menu can show exactly what a move would relocate.
     param(
         [Parameter(Mandatory)] [string]$AppName,
         [string]$BundleId = ''
     )
-    $rel = @("Application Support/$AppName", "Logs/$AppName")
+    $rel = @($AppName, "Application Support/$AppName", "Logs/$AppName")
     if ($BundleId) {
         $rel += @(
             "Application Support/$BundleId"
