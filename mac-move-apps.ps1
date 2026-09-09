@@ -189,7 +189,14 @@ function Invoke-Tool {
         [string[]]$ToolArgs = @(),
         [switch]$Tolerant
     )
-    $output = & $Name @ToolArgs 2>&1
+    $output = $null
+    try {
+        $output = & $Name @ToolArgs 2>&1
+    } catch {
+        # the tool itself was missing (e.g. a moved system binary), not a tool failure
+        if ($Tolerant) { return $null }
+        throw "could not run $Name`: $_"
+    }
     if ($LASTEXITCODE -ne 0 -and -not $Tolerant) {
         throw "$Name $($ToolArgs -join ' ') failed with exit $LASTEXITCODE`: $(($output | Out-String).Trim())"
     }
@@ -204,13 +211,16 @@ function Invoke-Trash {
     # of original user data go through here, never plain rm: a trashed item can
     # be pulled back out.
     param([Parameter(Mandatory)] [string[]]$Paths)
-    $trashArgs = @('-s') + $Paths
-    if (Test-Path -LiteralPath '/usr/bin/trash') {
-        $null = & /usr/bin/trash @trashArgs 2>$null
+    if (-not (Test-Path -LiteralPath '/usr/bin/trash')) {
+        Write-Caution "could not move to the Trash: /usr/bin/trash is not available: $($Paths -join ', ')"
+        return $false
     }
+    $trashArgs = @('-s') + $Paths
+    $output = & /usr/bin/trash @trashArgs 2>&1
     $failed = @($Paths | Where-Object { Test-Path -LiteralPath $_ })
     if ($failed.Count -gt 0) {
-        Write-Caution "could not move to the Trash: $($failed -join ', ')"
+        $reason = (($output | Out-String).Trim() -replace '\s+', ' ')
+        Write-Caution "could not move to the Trash: $($failed -join ', ')$(($reason) ? " ($reason)" : '')"
         return $false
     }
     return $true
@@ -538,6 +548,18 @@ function Read-MultiChoice {
     return , $names
 }
 
+function Test-AppRunning {
+    # True when a process runs from any of the given paths: apps launch as
+    # "<bundle>/Contents/MacOS/<binary>", so the bundle path with a trailing
+    # slash matches both symlink-launched and volume-launched processes.
+    param([Parameter(Mandatory)] [string[]]$Paths)
+    foreach ($path in $Paths) {
+        $null = pgrep -f ([regex]::Escape("$path/"))
+        if ($LASTEXITCODE -eq 0) { return $true }
+    }
+    return $false
+}
+
 function Test-AppReadyToMove {
     # Refuse already-symlinked and running apps. Reports the reason itself.
     param([Parameter(Mandatory)] [string]$Src)
@@ -546,8 +568,7 @@ function Test-AppReadyToMove {
         Write-Caution "$(Split-Path $Src -Leaf) is already a symlink to $(@($item.Target)[0]) - nothing to move."
         return $false
     }
-    $null = pgrep -f ([regex]::Escape("$Src/"))
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-AppRunning @($Src)) {
         Write-Caution "$(Split-Path $Src -Leaf) is running - quit it completely before moving."
         return $false
     }
@@ -867,6 +888,19 @@ function Format-Size {
     return "$SizeKb KB"
 }
 
+function Get-PathSizeKb {
+    # Total du size in KiB across the given paths; unreadable paths count as 0
+    # (du's stderr is suppressed, so callers treat 0 as 'unknown', never as
+    # measured-empty). Metadata reads only - milliseconds even for multi-GB trees.
+    param([Parameter(Mandatory)] [string[]]$Paths)
+    $total = 0L
+    foreach ($path in $Paths) {
+        $first = & du -sk $path 2>$null | Select-Object -First 1
+        if ("$first" -match '^(\d+)') { $total += [long]$Matches[1] }
+    }
+    return $total
+}
+
 function Get-AppSize {
     # Parallel du over each app's relocatable paths; returns a name-to-KiB hashtable.
     # du reads only directory metadata, so even multi-GB bundles size in milliseconds.
@@ -893,9 +927,17 @@ function Invoke-LibraryMove {
     # symlinking the original locations back. Preferences, Containers, and Group
     # Containers deliberately stay put: cfprefsd and sandbox path evaluation
     # misbehave through symlinks. Returns @{ Moved; Failed }.
-    # When a source removal fails partway, the volume copy is KEPT - it may be
-    # the only complete copy - and the entry counts as failed, with the manual
-    # finish steps printed. The copy is never rolled back.
+    # Failure handling is stage-aware, because each stage leaves a different
+    # state behind - the lesson of the Thunderbird data loss:
+    #   copy  : the original is intact and the destination copy is partial
+    #           rubble - the partial copy is trashed (a same-volume rename on
+    #           the destination's own volume, so it stays recoverable) and no
+    #           symlink steps are suggested: they would point at rubble.
+    #   trash : the original is intact and the copy is complete - the copy is
+    #           kept and the finish-by-hand steps are printed.
+    #   link  : the copy is complete and the original is already in the Trash -
+    #           only the symlink is missing.
+    # No stage ever deletes a complete copy of the data.
     param(
         [Parameter(Mandatory)] [string]$AppName,
         [Parameter(Mandatory)] [string]$BundlePath,
@@ -910,13 +952,51 @@ function Invoke-LibraryMove {
         if (-not (Test-Path -LiteralPath $libPath)) { continue }
         if ((Get-Item -LiteralPath $libPath -Force).LinkType) { continue }
         $dest = Join-Path $LibRoot $rel
+        # refuse destinations that overlap the source: trashing the source
+        # would take a copy sitting inside it down too (reachable when the
+        # destination root lives inside ~/Library/<app>)
+        $ordinal = [System.StringComparison]::OrdinalIgnoreCase
+        if ($dest.StartsWith("$libPath/", $ordinal) -or $libPath.StartsWith("$dest/", $ordinal)) {
+            Write-Caution "~/Library/${rel}: the destination overlaps it - skipping."
+            $failed++
+            continue
+        }
         try {
+            $stage = 'copy'
             [void][System.IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
+            # a leftover at the destination would make ditto merge into it, so
+            # stale files would survive a re-move. The intact local original is
+            # authoritative, so clear the leftover first - but refuse when it
+            # is far larger than the local data: that is the husk of an old
+            # failed removal, where the leftover may be the only complete copy
+            # and neither side gets touched.
+            if (Test-Path -LiteralPath $dest) {
+                $destItem = Get-Item -LiteralPath $dest -Force
+                if ($destItem.LinkType) {
+                    # a stale link - removing it never touches its target
+                    Remove-Item -LiteralPath $dest -Force
+                } else {
+                    $srcKb = Get-PathSizeKb @($libPath)
+                    $dstKb = Get-PathSizeKb @($dest)
+                    if ($dstKb -gt ($srcKb * 5)) {
+                        Write-Caution "~/Library/${rel}: the volume already holds a larger copy ($(Format-Size $dstKb)) than the local data ($(Format-Size $srcKb)) - it may be the only complete one, so neither side is touched. Inspect `"$dest`" and `"$libPath`"; if the volume copy is the good one, trash `"$libPath`" and move `"$dest`" to `"$libPath`" by hand."
+                        $failed++
+                        continue
+                    }
+                    if (-not (Invoke-Trash @($dest))) {
+                        Write-Caution "~/Library/${rel}: could not clear the leftover copy at the destination - skipping (the original is untouched)."
+                        $failed++
+                        continue
+                    }
+                    Write-Caution "~/Library/${rel}: cleared a leftover copy at $(($dest -replace [regex]::Escape($HOME), '~'))."
+                }
+            }
             Write-Info "moving ~/Library/$rel"
             Invoke-Tool ditto @($libPath, $dest)
             # trash the original - recoverable, and a rename rather than a
             # file-by-file walk, so nothing can race it mid-deletion; library
             # data is irreplaceable, so a failed trash NEVER falls back to rm
+            $stage = 'trash'
             if (-not (Invoke-Trash @($libPath))) {
                 Write-Caution 'first trash attempt failed - retrying once...'
                 Start-Sleep -Seconds 1
@@ -924,13 +1004,37 @@ function Invoke-LibraryMove {
                     throw "could not move ~/Library/$rel to the Trash"
                 }
             }
+            $stage = 'link'
             Invoke-Tool ln @('-s', $dest, $libPath)
         } catch {
-            # never delete the copy here: after a partial source removal it may
-            # be the only complete copy left
-            Write-Caution "could not finish moving ~/Library/${rel}: $_"
-            Write-Caution "kept the copy at $(($dest -replace [regex]::Escape($HOME), '~')) - to finish by hand:"
-            Write-Caution "  move `"$libPath`" to the Trash (or rm -rf it), then: ln -s `"$dest`" `"$libPath`""
+            $destTilde = $dest -replace [regex]::Escape($HOME), '~'
+            switch ($stage) {
+                'copy' {
+                    # the original is intact - the partial copy has no value
+                    Write-Caution "could not copy ~/Library/${rel}: $_"
+                    if (-not (Test-Path -LiteralPath $dest)) {
+                        Write-Caution 'the original is unchanged; nothing was copied.'
+                    } elseif (Invoke-Trash @($dest)) {
+                        Write-Caution "the original is unchanged; the incomplete copy at $destTilde was moved to the Trash."
+                    } else {
+                        Write-Caution "the original is unchanged; an incomplete copy remains at $destTilde - move it to the Trash by hand before re-running."
+                    }
+                }
+                'trash' {
+                    # the original is intact and the copy is complete - the
+                    # manual steps below are safe to follow
+                    Write-Caution "could not finish moving ~/Library/${rel}: $_"
+                    Write-Caution "kept the complete copy at $destTilde - to finish by hand:"
+                    Write-Caution "  move `"$libPath`" to the Trash, then: ln -s `"$dest`" `"$libPath`""
+                }
+                'link' {
+                    # the copy is complete and the original is already in the
+                    # Trash - only the link is missing
+                    Write-Caution "could not symlink ~/Library/${rel}: $_"
+                    Write-Caution "the data is safe at $destTilde and the original is in the Trash - finish by hand:"
+                    Write-Caution "  ln -s `"$dest`" `"$libPath`"  (if `"$libPath`" reappeared, move it to the Trash first)"
+                }
+            }
             $failed++
             continue
         }
@@ -941,12 +1045,16 @@ function Invoke-LibraryMove {
 
 function Invoke-LibraryRestore {
     # Reverse of Invoke-LibraryMove: walk the app's folder under the volume's
-    # App Library root and move each entry back to its ~/Library location,
-    # replacing the symlinks left there. The tree holds two shapes: a top-level
+    # App Library root and bring each entry back to its ~/Library location,
+    # replacing the symlinks left there: ditto home, then trash the volume
+    # original (recoverable, and a same-volume rename on its own volume - macOS
+    # keeps a per-volume .Trashes). The tree holds two shapes: a top-level
     # entry named after the app is the whole ~/Library/<app> dir (single level);
     # any other top-level dir is a group (Application Support, Caches, ...) whose
     # children map to ~/Library/<group>/<child>. Real entries at home are never
-    # clobbered. Returns the number of entries restored.
+    # clobbered, and a failed copy clears only the partial copy this function
+    # just started writing (home held only our symlink when the entry began), so
+    # a re-run is never blocked by rubble. Returns the number of entries restored.
     param(
         [Parameter(Mandatory)] [string]$AppName,
         [Parameter(Mandatory)] [string]$LibRoot
@@ -966,10 +1074,16 @@ function Invoke-LibraryRestore {
         }
         $null = [System.IO.Directory]::CreateDirectory((Split-Path $HomePath -Parent))
         try {
-            Invoke-Tool mv @($VolumeEntry, $HomePath)
+            Invoke-Tool ditto @($VolumeEntry, $HomePath)
         } catch {
             Write-Caution "could not restore ${HomePath}: $_"
+            # home held no real entry when this began, so any partial copy
+            # there is ours - clear it, and the volume original is untouched
+            $null = Invoke-Trash @($HomePath)
             return $false
+        }
+        if (-not (Invoke-Trash @($VolumeEntry))) {
+            Write-Caution "restored $HomePath, but the volume original could not be trashed - move `"$VolumeEntry`" to the Trash by hand"
         }
         return $true
     }
@@ -983,9 +1097,15 @@ function Invoke-LibraryRestore {
             if (-not $item.PSIsContainer) { continue }
             if (& $restoreEntry $item.FullName (Join-Path "$HOME/Library/$($top.Name)" $item.Name)) { $restored++ }
         }
-        if (-not (Get-ChildItem -LiteralPath $top.FullName -Force)) { Remove-Item -LiteralPath $top.FullName -Force }
+        # drop the scaffold group dir when this tool emptied it (a .DS_Store
+        # or other straggler keeps it alive - cosmetic either way)
+        if (-not (Get-ChildItem -LiteralPath $top.FullName -Force -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $top.FullName -Force -ErrorAction SilentlyContinue
+        }
     }
-    if (-not (Get-ChildItem -LiteralPath $LibRoot -Force)) { Remove-Item -LiteralPath $LibRoot -Force }
+    if (-not (Get-ChildItem -LiteralPath $LibRoot -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $LibRoot -Force -ErrorAction SilentlyContinue
+    }
     return $restored
 }
 
@@ -998,6 +1118,7 @@ function Invoke-BundleMove {
     )
     # expand ~ and relative destinations - native tools take them literally otherwise
     $DestDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestDir)
+    while ($DestDir.Length -gt 1 -and $DestDir.EndsWith('/')) { $DestDir = $DestDir.Substring(0, $DestDir.Length - 1) }
     $appFile = Split-Path $Src -Leaf
     $name = $appFile -replace '\.app$', ''
 
@@ -1016,6 +1137,17 @@ function Invoke-BundleMove {
         Write-Failure "destination $DestDir overlaps the source $Src - refusing to move."
         return $false
     }
+    # app data must never move into ~/Library: the library relocation would
+    # then copy and trash trees inside other apps' footprints
+    if ($DestDir.StartsWith("$HOME/Library/", $ordinal) -or $DestDir -eq "$HOME/Library") {
+        Write-Failure "destination $DestDir is inside ~/Library - refusing to move apps there."
+        return $false
+    }
+
+    # root-level destinations (a volume root itself) have no sibling spot for
+    # the app's ~/Library data. Case-sensitive on purpose: -ceq, because a
+    # lower-case '/volumes/...' path is a legitimate destination, not /Volumes
+    $rootDest = ($destParent -ceq '/' -or $destParent -ceq '/Volumes')
 
     try {
         # .NET call: literal path creation, unlike New-Item's wildcard-mangled -Path
@@ -1023,11 +1155,30 @@ function Invoke-BundleMove {
         if (Test-Path -LiteralPath $dst) {
             if ($Force) {
                 Write-Caution "destination exists, overwriting: $dst"
-                Remove-Item -LiteralPath $dst -Recurse -Force
+                if (-not (Invoke-Trash @($dst))) {
+                    # a bundle is re-downloadable, so an rm fallback is acceptable
+                    Invoke-Tool rm @('-rf', $dst)
+                }
             } else {
                 Write-Failure "destination already exists: $dst (re-run with -Force to overwrite)"
                 return $false
             }
+        }
+
+        # refuse moves that cannot fit: a mid-copy disk-full failure is the
+        # classic way relocation tools lose data, and du + df are metadata
+        # reads, so this costs milliseconds even for multi-GB apps
+        $relocatable = @(Get-AppRelocatable $Src)
+        $needKb = Get-PathSizeKb ($rootDest ? @($relocatable[0]) : $relocatable)
+        $dfRow = (df -k $DestDir | Select-Object -Skip 1) -split '\s+'
+        $freeKb = [long]$dfRow[3]
+        $mount = ($dfRow[5..($dfRow.Count - 1)] -join ' ').Trim()
+        if ($mount -eq '/' -or $mount -eq '/System/Volumes/Data') {
+            Write-Caution "$DestDir is on the internal disk - the move frees no internal space."
+        }
+        if ($freeKb -lt [Math]::Ceiling($needKb * 1.05)) {
+            Write-Failure "not enough space on ${DestDir}: $(Format-Size $needKb) to move, $(Format-Size $freeKb) free - nothing was copied."
+            return $false
         }
     } catch {
         Write-Failure "cannot prepare the destination: $_"
@@ -1044,10 +1195,13 @@ function Invoke-BundleMove {
         Invoke-Tool ditto @($Src, $dst)
     } catch {
         Write-Failure "ditto copy failed: $_"
-        # plain rm on purpose: this is the partial copy WE just created on the
-        # destination volume (never user data, the original is intact), and
-        # trashing it would copy it back across volumes into ~/.Trash
-        $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
+        # the partial copy is ours and the original is intact; trash it - on
+        # the destination's own volume the Trash is a same-volume rename
+        # (macOS keeps a per-volume .Trashes), so this stays cheap - with an
+        # rm fallback, since a bundle is re-downloadable
+        if (-not (Invoke-Trash @($dst))) {
+            $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
+        }
         return $false
     }
 
@@ -1094,7 +1248,7 @@ function Invoke-BundleMove {
 
     # relocate the app's ~/Library footprint next to the bundle on the volume;
     # skipped for root-level destinations, which have no sensible sibling spot
-    if ($destParent -ne '/' -and $destParent -ne '/Volumes') {
+    if (-not $rootDest) {
         $libRoot = Join-Path $destParent "App Library/$name"
         $libMoved = 0
         $libFailed = 0
@@ -1117,7 +1271,9 @@ function Get-AppInventory {
     # Installed apps enriched with tier, relocatable paths, and sizes - the shared
     # base for the multiselect and the list output, sorted safe → unlisted →
     # caution → avoid, then by name. Empty when nothing is installed.
-    $installed = @(Get-InstalledApp)
+    # Group-Object keeps the first occurrence per name (search-dir order), so
+    # the same bundle in /Applications and ~/Applications counts once
+    $installed = @(Get-InstalledApp | Group-Object Name | ForEach-Object { $_.Group[0] })
     if ($installed.Count -eq 0) { return @() }
     $infos = foreach ($app in $installed) {
         [pscustomobject]@{ Name = $app.Name; Path = $app.Path; Paths = @(Get-AppRelocatable $app.Path) }
@@ -1185,7 +1341,7 @@ function Invoke-MoveBatch {
         Write-Host '  - refresh caches:  pwsh -File ./mac-move-apps.ps1 refresh <app>'
         Write-Host '  - undo everything: pwsh -File ./mac-move-apps.ps1 restore'
     }
-    if ($failed -gt 0 -and $moved -eq 0) { exit 1 }
+    if ($failed -gt 0) { exit 1 }
 }
 
 function Invoke-Move {
@@ -1210,6 +1366,38 @@ function Invoke-Move {
     Write-Host 'Next steps:'
     Write-Host "  - refresh caches:  pwsh -File ./mac-move-apps.ps1 refresh $appFile"
     Write-Host '  - undo everything: pwsh -File ./mac-move-apps.ps1 restore'
+}
+
+function Restore-OneBundle {
+    # Bring one moved bundle back to its home path: remove the home symlink,
+    # ditto the volume bundle over, then trash the volume original (recoverable,
+    # and a same-volume rename on the volume). On a copy failure the
+    # half-written home copy is cleared and the home symlink is recreated, so
+    # the volume copy stays reachable and nothing is lost. Prints the trailing
+    # result word on failure; returns $true when the bundle is back home.
+    param(
+        [Parameter(Mandatory)] [string]$LinkPath,
+        [Parameter(Mandatory)] [string]$TargetPath
+    )
+    try {
+        # the symlink only - the caller verified the home path is still a link
+        Remove-Item -LiteralPath $LinkPath
+        Invoke-Tool ditto @($TargetPath, $LinkPath)
+    } catch {
+        Write-Host 'failed'
+        Write-Caution "  could not restore the bundle: $_"
+        $left = Get-Item -LiteralPath $LinkPath -Force -ErrorAction SilentlyContinue
+        if ($left -and -not $left.LinkType) { $null = Invoke-Trash @($LinkPath) }
+        if (-not (Test-Path -LiteralPath $LinkPath)) {
+            $null = Invoke-Tool ln @('-s', $TargetPath, $LinkPath) -Tolerant
+        }
+        return $false
+    }
+    if (-not (Invoke-Trash @($TargetPath))) {
+        Write-Caution "  the bundle is home, but the volume copy could not be trashed - move `"$TargetPath`" to the Trash by hand"
+    }
+    $null = Invoke-Tool $LsRegister @('-f', $LinkPath) -Tolerant
+    return $true
 }
 
 function Invoke-Restore {
@@ -1238,6 +1426,7 @@ function Invoke-Restore {
 
     $restored = 0
     $failed = 0
+    $skipped = 0
     foreach ($app in $moved) {
         Write-Host -NoNewline "  restoring $($app.Name)... "
         if (-not (Test-Path -LiteralPath $app.Target)) {
@@ -1245,46 +1434,50 @@ function Invoke-Restore {
             $failed++
             continue
         }
-        $bundleOk = $false
-        try {
-            Remove-Item -LiteralPath $app.LinkPath
-            Invoke-Tool mv @($app.Target, $app.LinkPath)
-            $bundleOk = $true
-        } catch {
-            Write-Host 'failed'
-            Write-Caution "  could not restore $($app.Name): $_"
-            # relink so the external copy stays reachable
-            if (-not (Test-Path -LiteralPath $homePath)) {
-                $null = Invoke-Tool ln @('-s', $app.Target, $app.LinkPath) -Tolerant
-            }
+        $linkItem = Get-Item -LiteralPath $app.LinkPath -Force -ErrorAction SilentlyContinue
+        if (-not $linkItem -or $linkItem.LinkType -ne 'SymbolicLink') {
+            Write-Host 'skipped - the home path is no longer a symlink (a real app may have replaced it)'
+            $skipped++
+            continue
+        }
+        if (Test-AppRunning @($app.LinkPath, $app.Target)) {
+            Write-Host 'skipped - the app is running; quit it completely and re-run'
+            $skipped++
+            continue
+        }
+        # Restore-OneBundle prints the trailing 'failed' word itself; nothing
+        # is ever deleted on failure - the volume copy stays reachable
+        if (-not (Restore-OneBundle -LinkPath $app.LinkPath -TargetPath $app.Target)) {
             $failed++
+            continue
         }
-        if ($bundleOk) {
-            # bring the app's ~/Library entries back from the volume's App Library;
-            # a library failure never fails the restored bundle itself
-            $libRoot = Join-Path (Split-Path (Split-Path $app.Target -Parent) -Parent) "App Library/$($app.Name)"
-            $libRestored = 0
-            try {
-                $libRestored = Invoke-LibraryRestore -AppName $app.Name -LibRoot $libRoot
-            } catch {
-                Write-Caution "  could not restore ~/Library entries for $($app.Name): $_"
-            }
-            Write-Host "done$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')"
-            $restored++
+        # bring the app's ~/Library entries back from the volume's App Library;
+        # a library failure never fails the restored bundle itself
+        $libRoot = Join-Path (Split-Path (Split-Path $app.Target -Parent) -Parent) "App Library/$($app.Name)"
+        $libRestored = 0
+        try {
+            $libRestored = Invoke-LibraryRestore -AppName $app.Name -LibRoot $libRoot
+        } catch {
+            Write-Caution "  could not restore ~/Library entries for $($app.Name): $_"
         }
+        # the bundle lives at its home path again - repoint Mozilla profiles.ini
+        # at the home install hash, or the next launch presents a fresh profile
+        $null = Invoke-MozillaRepoint -AppName $app.Name -BundlePath $app.LinkPath
+        Write-Host "done$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')"
+        $restored++
     }
 
     Write-Host ''
     if ($restored -gt 0) {
-        Write-Info "restored $restored app(s), failed $failed."
+        Write-Info "restored $restored app(s), skipped $skipped, failed $failed."
         Write-Info 'refreshing LaunchServices, Dock, and Finder...'
         $null = Invoke-Tool $LsRegister @('-kill', '-r', '-domain', 'local', '-domain', 'system', '-domain', 'user') -Tolerant
         $null = Invoke-Tool killall @('Dock') -Tolerant
         $null = Invoke-Tool killall @('Finder') -Tolerant
     } else {
-        Write-Failure "restored 0 app(s), failed $failed."
-        exit 1
+        Write-Failure "restored 0 app(s), skipped $skipped, failed $failed."
     }
+    if ($failed -gt 0) { exit 1 }
 }
 
 function Get-MoveAudit {
@@ -1323,10 +1516,7 @@ function Get-MoveAudit {
                         $problems += "dangling link: ~/Library/$rel"
                     }
                 } else {
-                    $kb = 0
-                    $first = & du -sk $homePath 2>$null | Select-Object -First 1
-                    if ("$first" -match '^(\d+)') { $kb = [long]$Matches[1] }
-                    $partial += [pscustomobject]@{ Path = $homePath; SizeKb = $kb }
+                    $partial += [pscustomobject]@{ Path = $homePath; SizeKb = (Get-PathSizeKb @($homePath)) }
                     $problems += "still local: ~/Library/$rel"
                 }
             }
@@ -1414,6 +1604,7 @@ function Invoke-Doctor {
 
     $fixed = 0
     $skipped = 0
+    $failedFixes = 0
     $bundlesReverted = 0
     foreach ($record in $records) {
         Write-Host ''
@@ -1426,57 +1617,87 @@ function Invoke-Doctor {
             $skipped++
             continue
         }
-        if ($choice -eq 'complete') {
-            if (-not (Test-Path -LiteralPath $record.Target)) {
-                Write-Failure "$($record.Name): the bundle is gone from the volume - only revert (or reinstall) can fix this."
-                $skipped++
-                continue
-            }
-            $running = $false
-            foreach ($probe in @("$($record.Link)/", "$($record.Target)/")) {
-                $null = pgrep -f ([regex]::Escape($probe))
-                if ($LASTEXITCODE -eq 0) { $running = $true; break }
-            }
-            if ($running) {
-                Write-Caution "$($record.Name): the app is running (launched via the symlink or the volume) - quit it before completing."
-                $skipped++
-                continue
-            }
-            $libMoved = 0
-            $libFailed = 0
-            if ($record.Partial.Count -gt 0) {
-                $libResult = Invoke-LibraryMove -AppName $record.Name -BundlePath $record.Target -LibRoot $record.LibRoot
-                $libMoved = $libResult.Moved
-                $libFailed = $libResult.Failed
-            }
-            foreach ($orphan in $record.Orphans) {
-                $null = [System.IO.Directory]::CreateDirectory((Split-Path $orphan.Home -Parent))
-                $null = Invoke-Tool ln @('-s', $orphan.Volume, $orphan.Home)
-                $libMoved++
-            }
-            # Mozilla-family apps: repoint profiles.ini at the existing profile so
-            # the next launch from the volume keeps it instead of starting fresh
-            $null = Invoke-MozillaRepoint -AppName $record.Name -BundlePath $record.Target
-            if ($libFailed -gt 0) {
-                Write-Caution "$($record.Name): completed with $libFailed library failure(s) - see warnings above, nothing was deleted."
+        try {
+            if ($choice -eq 'complete') {
+                if (-not (Test-Path -LiteralPath $record.Target)) {
+                    Write-Failure "$($record.Name): the bundle is gone from the volume - only revert (or reinstall) can fix this."
+                    $skipped++
+                    continue
+                }
+                if (Test-AppRunning @($record.Link, $record.Target)) {
+                    Write-Caution "$($record.Name): the app is running (launched via the symlink or the volume) - quit it before completing."
+                    $skipped++
+                    continue
+                }
+                # refuse completions that cannot fit: a mid-copy disk-full
+                # failure is the classic way relocation tools lose data
+                if ($record.Partial.Count -gt 0) {
+                    $needKb = ($record.Partial | Measure-Object -Property SizeKb -Sum).Sum
+                    $dfRow = (df -k $record.Target | Select-Object -Skip 1) -split '\s+'
+                    $freeKb = [long]$dfRow[3]
+                    if ($freeKb -lt [Math]::Ceiling($needKb * 1.05)) {
+                        Write-Caution "$($record.Name): not enough space on the volume to complete - $(Format-Size $needKb) to move, $(Format-Size $freeKb) free. Nothing was copied."
+                        $skipped++
+                        continue
+                    }
+                }
+                $libMoved = 0
+                $libFailed = 0
+                if ($record.Partial.Count -gt 0) {
+                    $libResult = Invoke-LibraryMove -AppName $record.Name -BundlePath $record.Target -LibRoot $record.LibRoot
+                    $libMoved = $libResult.Moved
+                    $libFailed = $libResult.Failed
+                }
+                foreach ($orphan in $record.Orphans) {
+                    $null = [System.IO.Directory]::CreateDirectory((Split-Path $orphan.Home -Parent))
+                    $null = Invoke-Tool ln @('-s', $orphan.Volume, $orphan.Home)
+                    $libMoved++
+                }
+                # Mozilla-family apps: repoint profiles.ini at the existing profile so
+                # the next launch from the volume keeps it instead of starting fresh
+                $null = Invoke-MozillaRepoint -AppName $record.Name -BundlePath $record.Target
+                if ($libFailed -gt 0) {
+                    Write-Caution "$($record.Name): completed with $libFailed library failure(s) - see warnings above; no original data was deleted."
+                } else {
+                    Write-Info "$($record.Name): completed$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')."
+                }
+                $fixed++
             } else {
-                Write-Info "$($record.Name): completed$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')."
+                # revert: bundle first, then library entries, then clean dangling links
+                $linkItem = Get-Item -LiteralPath $record.Link -Force -ErrorAction SilentlyContinue
+                if (-not $linkItem -or $linkItem.LinkType -ne 'SymbolicLink') {
+                    Write-Failure "$($record.Name): the home path is no longer a symlink - skipping (a real app may have replaced it)."
+                    $skipped++
+                    continue
+                }
+                if (Test-AppRunning @($record.Link, $record.Target)) {
+                    Write-Caution "$($record.Name): the app is running - quit it before reverting."
+                    $skipped++
+                    continue
+                }
+                if (Test-Path -LiteralPath $record.Target) {
+                    if (Restore-OneBundle -LinkPath $record.Link -TargetPath $record.Target) {
+                        $bundlesReverted++
+                    } else {
+                        $failedFixes++
+                        continue
+                    }
+                } else {
+                    Remove-Item -LiteralPath $record.Link
+                    Write-Caution "$($record.Name): volume bundle was gone - removed the dangling symlink only."
+                }
+                foreach ($dangling in $record.Broken) { Remove-Item -LiteralPath $dangling -Force -ErrorAction SilentlyContinue }
+                $libRestored = Invoke-LibraryRestore -AppName $record.Name -LibRoot $record.LibRoot
+                # the bundle is back at its home path - repoint Mozilla profiles.ini
+                # at the home install hash, so the next launch from /Applications
+                # keeps the existing profile instead of starting fresh
+                $null = Invoke-MozillaRepoint -AppName $record.Name -BundlePath $record.Link
+                Write-Info "$($record.Name): reverted$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')."
+                $fixed++
             }
-            $fixed++
-        } else {
-            # revert: bundle first, then library entries, then clean dangling links
-            if (Test-Path -LiteralPath $record.Target) {
-                Remove-Item -LiteralPath $record.Link
-                Invoke-Tool mv @($record.Target, $record.Link)
-                $bundlesReverted++
-            } else {
-                Remove-Item -LiteralPath $record.Link
-                Write-Caution "$($record.Name): volume bundle was gone - removed the dangling symlink only."
-            }
-            foreach ($dangling in $record.Broken) { Remove-Item -LiteralPath $dangling -Force }
-            $libRestored = Invoke-LibraryRestore -AppName $record.Name -LibRoot $record.LibRoot
-            Write-Info "$($record.Name): reverted$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')."
-            $fixed++
+        } catch {
+            Write-Failure "$($record.Name): $choice failed - $_ (re-run doctor to retry once the cause above is resolved)."
+            $failedFixes++
         }
     }
 
@@ -1488,8 +1709,8 @@ function Invoke-Doctor {
         $null = Invoke-Tool killall @('Finder') -Tolerant
     }
     Write-Host ''
-    Write-Info "doctored $fixed app(s), skipped $skipped."
-    if ($fixed -eq 0 -and $records.Count -gt 0) { exit 1 }
+    Write-Info "doctored $fixed app(s), skipped $skipped, failed $failedFixes."
+    if ($failedFixes -gt 0) { exit 1 }
 }
 
 function Invoke-Refresh {
@@ -1502,6 +1723,9 @@ function Invoke-Refresh {
     }
     $item = Get-Item -LiteralPath $path
     $realPath = ($item.LinkType -eq 'SymbolicLink' -and $item.Target) ? @($item.Target)[0] : $item.FullName
+    if ($item.LinkType -eq 'SymbolicLink' -and -not (Test-Path -LiteralPath $realPath)) {
+        Write-Caution "the linked bundle is missing: $realPath - refresh cannot fix a broken move (try doctor)."
+    }
     Write-Info "refreshing $appFile at $realPath"
 
     Write-Info 're-registering with LaunchServices...'
