@@ -1050,7 +1050,7 @@ function Get-MoveAudit {
 
             $tier = Get-MoveTier $name
             if ($tier -in 'caution', 'avoid') {
-                $problems += "on the $tier list while moved - the app may misbehave from the volume (Mozilla apps come up with a fresh profile; only reverting restores the original install path)"
+                $problems += "on the $tier list while moved - Mozilla apps pick their default profile by install path, so a volume-moved app starts fresh; revert fixes it automatically, or re-point Default= in the app's profiles.ini to keep it on the volume"
             }
         } catch {
             $problems += "audit failed (volume unreadable?): $_"
@@ -1097,8 +1097,8 @@ function Invoke-Doctor {
             Write-Host "  completing would move $(Format-Size $sum) to the volume"
         }
         if ($record.Tier -in 'caution', 'avoid') {
-            Write-Caution '  reverting restores the original install path; completing does not -'
-            Write-Caution '  a locked-tier app keeps misbehaving from the volume until reverted.'
+            Write-Caution '  reverting restores the original install path and fixes profile selection;'
+            Write-Caution '  to keep it on the volume instead, re-point Default= in the app''s profiles.ini.'
         }
     }
 
