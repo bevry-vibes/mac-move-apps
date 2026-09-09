@@ -872,7 +872,10 @@ function Invoke-LibraryMove {
     # Caches, Logs, WebKit, HTTPStorages, Saved Application State - to LibRoot,
     # symlinking the original locations back. Preferences, Containers, and Group
     # Containers deliberately stay put: cfprefsd and sandbox path evaluation
-    # misbehave through symlinks. Returns the number of entries moved.
+    # misbehave through symlinks. Returns @{ Moved; Failed }.
+    # When a source removal fails partway, the volume copy is KEPT - it may be
+    # the only complete copy - and the entry counts as failed, with the manual
+    # finish steps printed. The copy is never rolled back.
     param(
         [Parameter(Mandatory)] [string]$AppName,
         [Parameter(Mandatory)] [string]$BundlePath,
@@ -881,26 +884,38 @@ function Invoke-LibraryMove {
     $bundleId = Get-AppBundleIdentifier $BundlePath
     $relPaths = Get-AppLibraryRelPath -AppName $AppName -BundleId $bundleId
     $moved = 0
+    $failed = 0
     foreach ($rel in ($relPaths | Select-Object -Unique)) {
         $libPath = Join-Path "$HOME/Library" $rel
         if (-not (Test-Path -LiteralPath $libPath)) { continue }
         if ((Get-Item -LiteralPath $libPath -Force).LinkType) { continue }
         $dest = Join-Path $LibRoot $rel
         try {
-            # library relocation is best-effort: one bad entry never fails the move
             [void][System.IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
             Write-Info "moving ~/Library/$rel"
             Invoke-Tool ditto @($libPath, $dest)
-            Invoke-Tool rm @('-rf', $libPath)
+            # a Finder window or editor can race rm by dropping fresh files
+            # (.DS_Store) into the directory - "Directory not empty" - retry once
+            try {
+                Invoke-Tool rm @('-rf', $libPath)
+            } catch {
+                Write-Caution "first removal failed (close Finder windows/editors holding ~/Library/$rel) - retrying..."
+                Start-Sleep -Seconds 1
+                Invoke-Tool rm @('-rf', $libPath)
+            }
             Invoke-Tool ln @('-s', $dest, $libPath)
         } catch {
-            Write-Caution "could not move ~/Library/${rel}: $_"
-            $null = Invoke-Tool rm @('-rf', $dest) -Tolerant
+            # never delete the copy here: after a partial source removal it may
+            # be the only complete copy left
+            Write-Caution "could not finish moving ~/Library/${rel}: $_"
+            Write-Caution "kept the copy at $(($dest -replace [regex]::Escape($HOME), '~')) - to finish by hand once nothing holds the directory:"
+            Write-Caution "  rm -rf `"$libPath`" && ln -s `"$dest`" `"$libPath`""
+            $failed++
             continue
         }
         $moved++
     }
-    return $moved
+    return @{ Moved = $moved; Failed = $failed }
 }
 
 function Invoke-LibraryRestore {
@@ -1020,9 +1035,11 @@ function Invoke-BundleMove {
         try {
             Invoke-Tool sudo @('rm', '-rf', $Src)
         } catch {
+            # the copy is never deleted here: a half-finished removal leaves the
+            # original damaged and the copy as the only complete version
             Write-Failure "could not remove the original: $_"
-            $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
-            Write-Caution "rolled back the copy at $dst"
+            Write-Caution "kept the copy at $dst - once nothing holds the original, finish by hand:"
+            Write-Caution "  rm -rf `"$Src`" && ln -s `"$dst`" `"$Src`""
             return $false
         }
     }
@@ -1054,12 +1071,16 @@ function Invoke-BundleMove {
     if ($destParent -ne '/' -and $destParent -ne '/Volumes') {
         $libRoot = Join-Path $destParent "App Library/$name"
         $libMoved = 0
+        $libFailed = 0
         try {
-            $libMoved = Invoke-LibraryMove -AppName $name -BundlePath $Src -LibRoot $libRoot
+            $libResult = Invoke-LibraryMove -AppName $name -BundlePath $Src -LibRoot $libRoot
+            $libMoved = $libResult.Moved
+            $libFailed = $libResult.Failed
         } catch {
             Write-Caution "library relocation failed for $name (the bundle move is unaffected): $_"
         }
-        Write-Info "moved $appFile to $dst$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')"
+        $suffix = (($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '') + (($libFailed -gt 0) ? " ($libFailed library entries need attention - see warnings)" : '')
+        Write-Info "moved $appFile to $dst$suffix"
     } else {
         Write-Info "moved $appFile to $dst (~/Library entries stay put - destination has no sibling dir)"
     }
@@ -1385,15 +1406,22 @@ function Invoke-Doctor {
                 $skipped++
                 continue
             }
-            $null = pgrep -f ([regex]::Escape("$($record.Target)/"))
-            if ($LASTEXITCODE -eq 0) {
-                Write-Caution "$($record.Name): the app is running from the volume - quit it before completing."
+            $running = $false
+            foreach ($probe in @("$($record.Link)/", "$($record.Target)/")) {
+                $null = pgrep -f ([regex]::Escape($probe))
+                if ($LASTEXITCODE -eq 0) { $running = $true; break }
+            }
+            if ($running) {
+                Write-Caution "$($record.Name): the app is running (launched via the symlink or the volume) - quit it before completing."
                 $skipped++
                 continue
             }
             $libMoved = 0
+            $libFailed = 0
             if ($record.Partial.Count -gt 0) {
-                $libMoved = Invoke-LibraryMove -AppName $record.Name -BundlePath $record.Target -LibRoot $record.LibRoot
+                $libResult = Invoke-LibraryMove -AppName $record.Name -BundlePath $record.Target -LibRoot $record.LibRoot
+                $libMoved = $libResult.Moved
+                $libFailed = $libResult.Failed
             }
             foreach ($orphan in $record.Orphans) {
                 $null = [System.IO.Directory]::CreateDirectory((Split-Path $orphan.Home -Parent))
@@ -1403,7 +1431,11 @@ function Invoke-Doctor {
             # Mozilla-family apps: repoint profiles.ini at the existing profile so
             # the next launch from the volume keeps it instead of starting fresh
             $null = Invoke-MozillaRepoint -AppName $record.Name -BundlePath $record.Target
-            Write-Info "$($record.Name): completed$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')."
+            if ($libFailed -gt 0) {
+                Write-Caution "$($record.Name): completed with $libFailed library failure(s) - see warnings above, nothing was deleted."
+            } else {
+                Write-Info "$($record.Name): completed$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')."
+            }
             $fixed++
         } else {
             # revert: bundle first, then library entries, then clean dangling links
