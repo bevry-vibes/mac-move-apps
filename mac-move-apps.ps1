@@ -9,7 +9,9 @@
 
       move [app] [destination]   Copy the .app bundle to external storage with ditto,
                                  replace the original with a symlink, clear quarantine,
-                                 ad-hoc re-sign, and re-register with LaunchServices.
+                                 keep the original signature (re-signing ad-hoc only
+                                 when the copy broke it), and re-register with
+                                 LaunchServices.
                                  The app's ~/Library footprint (Application Support,
                                  Caches, Logs, WebKit, HTTPStorages, Saved Application
                                  State) moves to the volume's 'App Library' folder too,
@@ -32,7 +34,8 @@
                                  the app back to the internal disk.
       refresh <app>              Re-register an app with LaunchServices and refresh
                                  Dock, Finder, and Spotlight; -ForceRepair also
-                                 clears xattrs and re-signs.
+                                 clears quarantine and re-signs the app only when
+                                 its signature is broken.
 
     The move-safety tiers are enforced, not advisory: apps on the caution or avoid
     lists are locked in the multiselect and refused by direct move.
@@ -180,6 +183,13 @@ function Write-Info    { param([string]$Message) Write-Host "$($PSStyle.Foregrou
 function Write-Caution { param([string]$Message) Write-Host "$($PSStyle.Foreground.Yellow)warn $Message$($PSStyle.Reset)" }
 function Write-Failure { param([string]$Message) Write-Host "$($PSStyle.Foreground.Red)fail $Message$($PSStyle.Reset)" }
 function Write-Preview { param([string]$Message) Write-Host "$($PSStyle.Foreground.BrightMagenta)dry  $Message$($PSStyle.Reset)" }
+
+function Write-RemovableVolumeNote {
+    # Printed after library data lands on an external volume: macOS gates app
+    # access to removable volumes behind a TCC permission, so the first launch
+    # may prompt (or fail with EPERM until granted).
+    Write-Info 'app data now lives on a removable volume - on first launch macOS may ask for "Removable Volumes" access: allow it (System Settings > Privacy & Security > Files & Folders)'
+}
 
 function Invoke-Tool {
     # Run a native tool with stderr captured into the returned output.
@@ -347,7 +357,8 @@ Options:
   -Force        move: overwrite an existing app at the destination.
   -DryRun       restore: preview what would move, change nothing.
   -Yes          restore: skip the confirmation prompt.
-  -ForceRepair  refresh: also clear xattrs and re-sign the app.
+  -ForceRepair  refresh: also clear quarantine and re-sign the app when its
+                signature is broken (a valid original signature is kept intact).
   -Direction    doctor: 'complete' or 'revert' - apply to every problem app
                 without asking.
 
@@ -1234,10 +1245,21 @@ function Invoke-BundleMove {
         return $false
     }
 
-    # clear quarantine and re-sign so Gatekeeper accepts the relocated bundle
-    Write-Info 'clearing extended attributes and re-signing...'
-    $null = Invoke-Tool xattr @('-cr', $dst) -Tolerant
-    $null = Invoke-Tool codesign @('--force', '--deep', '--sign', '-', $dst) -Tolerant
+    # clear quarantine (only if ditto carried it over) and keep the ORIGINAL
+    # signature: ad-hoc re-signing replaces the Developer ID and unbinds every
+    # TCC permission the app had (removable volumes, screen capture, ...), so
+    # it is strictly a fallback for a copy that actually broke the signature
+    $null = Invoke-Tool xattr @('-d', 'com.apple.quarantine', $dst) -Tolerant
+    $verifyOutput = codesign --verify $dst 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $reason = (($verifyOutput | Out-String).Trim() -replace '\s+', ' ')
+        Write-Caution "the original signature did not survive the copy ($reason) - re-signing ad-hoc; TCC grants (removable volumes, screen capture, ...) will need re-approval"
+        try {
+            Invoke-Tool codesign @('--force', '--deep', '--sign', '-', $dst)
+        } catch {
+            Write-Caution "re-sign failed - the app may not launch from the volume: $(($_.ToString()))"
+        }
+    }
 
     Write-Info 're-registering with LaunchServices...'
     $null = Invoke-Tool $LsRegister @('-f', $dst) -Tolerant
@@ -1261,6 +1283,7 @@ function Invoke-BundleMove {
         }
         $suffix = (($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '') + (($libFailed -gt 0) ? " ($libFailed library entries need attention - see warnings)" : '')
         Write-Info "moved $appFile to $dst$suffix"
+        if ($libMoved -gt 0) { Write-RemovableVolumeNote }
     } else {
         Write-Info "moved $appFile to $dst (~/Library entries stay put - destination has no sibling dir)"
     }
@@ -1661,6 +1684,7 @@ function Invoke-Doctor {
                 } else {
                     Write-Info "$($record.Name): completed$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')."
                 }
+                if ($libMoved -gt 0) { Write-RemovableVolumeNote }
                 $fixed++
             } else {
                 # revert: bundle first, then library entries, then clean dangling links
@@ -1732,9 +1756,21 @@ function Invoke-Refresh {
     $null = Invoke-Tool $LsRegister @('-f', $realPath) -Tolerant
 
     if ($ForceRepair) {
-        Write-Info 'clearing extended attributes and re-signing...'
-        $null = Invoke-Tool xattr @('-cr', $realPath) -Tolerant
-        $null = Invoke-Tool codesign @('--force', '--deep', '--sign', '-', $realPath) -Tolerant
+        # same policy as move: keep a valid original signature; re-signing is
+        # a fallback, because an ad-hoc signature unbinds existing TCC grants
+        $null = Invoke-Tool xattr @('-d', 'com.apple.quarantine', $realPath) -Tolerant
+        $verifyOutput = codesign --verify $realPath 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $reason = (($verifyOutput | Out-String).Trim() -replace '\s+', ' ')
+            Write-Caution "signature check failed ($reason) - re-signing ad-hoc; TCC grants (removable volumes, screen capture, ...) will need re-approval"
+            try {
+                Invoke-Tool codesign @('--force', '--deep', '--sign', '-', $realPath)
+            } catch {
+                Write-Caution "re-sign failed: $(($_.ToString()))"
+            }
+        } else {
+            Write-Info 'signature verified - kept intact.'
+        }
     }
 
     Write-Info 'refreshing Dock, Finder, and Spotlight...'
