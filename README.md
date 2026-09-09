@@ -31,6 +31,7 @@ The script has a `pwsh` shebang — `chmod +x ./mac-move-apps.ps1` once, then `.
 | `restore` | Moves every externally-stored app — and its `~/Library` entries — back to its original location on the internal disk. |
 | `list` | Shows installed apps categorised by move safety, tier-coloured, with per-app sizes, section totals, and a movable grand total. |
 | `status` | Shows apps already moved (symlinks targeting `/Volumes`). |
+| `doctor` | Audits moved apps for partial or broken relocations — data left behind locally (e.g. apps moved before a `~/Library` location was covered, like Thunderbird's top-level dir), dangling symlinks, volume entries orphaned from their home, and moved apps now on the locked tiers — then asks per app which direction to fix: `complete` (finish moving the remaining data to the volume) or `revert` (bring the app back to the internal disk). `-Direction complete|revert` skips the asking. |
 | `refresh <app>` | Refreshes LaunchServices, Dock, Finder, and Spotlight for a moved app. |
 
 Options: `-Force` (move: overwrite an existing target), `-DryRun` (restore: preview only), `-Yes` (restore: skip the prompt), `-ForceRepair` (refresh: also clear xattrs and re-sign).

@@ -24,6 +24,12 @@
       list                       Show installed apps categorised by how safe they
                                  are to move, with sizes and totals.
       status                     Show apps already moved to external storage.
+      doctor                     Audit moved apps for partial or broken relocations
+                                 (data left behind, dangling links, volume orphans,
+                                 locked-tier apps like the Mozilla family), then fix
+                                 each in the direction you choose: complete moves
+                                 remaining local data to the volume, revert moves
+                                 the app back to the internal disk.
       refresh <app>              Re-register an app with LaunchServices and refresh
                                  Dock, Finder, and Spotlight; -ForceRepair also
                                  clears xattrs and re-signs.
@@ -58,6 +64,16 @@
     pwsh -File ./mac-move-apps.ps1 restore -DryRun
 
 .EXAMPLE
+    pwsh -File ./mac-move-apps.ps1 doctor
+
+    Reports every inconsistent moved app and asks per app: complete, revert, or skip.
+
+.EXAMPLE
+    pwsh -File ./mac-move-apps.ps1 doctor -Direction revert
+
+    Brings every problem app back to the internal disk without asking.
+
+.EXAMPLE
     pwsh -File ./mac-move-apps.ps1 refresh IINA -ForceRepair
 #>
 [CmdletBinding()]
@@ -68,7 +84,8 @@ param(
     [switch]$Force,
     [switch]$DryRun,
     [switch]$Yes,
-    [switch]$ForceRepair
+    [switch]$ForceRepair,
+    [ValidateSet('', 'complete', 'revert')][string]$Direction = ''
 )
 
 Set-StrictMode -Version Latest
@@ -291,18 +308,26 @@ Commands:
   status                    Show apps already moved to external storage.
   refresh <app>             Refresh LaunchServices, Dock, Finder, and Spotlight
                             for a moved app.
+  doctor                    Audit moved apps for partial or broken relocations,
+                            then fix each in the direction you choose:
+                            complete = move remaining local data to the volume,
+                            revert = move the app back to the internal disk.
 
 Options:
   -Force        move: overwrite an existing app at the destination.
   -DryRun       restore: preview what would move, change nothing.
   -Yes          restore: skip the confirmation prompt.
   -ForceRepair  refresh: also clear xattrs and re-sign the app.
+  -Direction    doctor: 'complete' or 'revert' - apply to every problem app
+                without asking.
 
 Examples:
   pwsh -File ./mac-move-apps.ps1 move
   pwsh -File ./mac-move-apps.ps1 move 'Visual Studio Code'
   pwsh -File ./mac-move-apps.ps1 move Motrix /Volumes/Scratchpad/Applications
   pwsh -File ./mac-move-apps.ps1 restore -DryRun
+  pwsh -File ./mac-move-apps.ps1 doctor
+  pwsh -File ./mac-move-apps.ps1 doctor -Direction revert
   pwsh -File ./mac-move-apps.ps1 refresh IINA -ForceRepair
 
 Apps are searched for in /Applications and ~/Applications.
@@ -510,11 +535,14 @@ function Test-AppReadyToMove {
 }
 
 function Get-AppBundleIdentifier {
-    # Read CFBundleIdentifier from an app bundle's Info.plist; '' when unreadable.
+    # Read CFBundleIdentifier from an app bundle's Info.plist; '' when unreadable
+    # (no plist, or the read is denied). Direct native call so $LASTEXITCODE is
+    # this scope's, not an inner function's.
     param([Parameter(Mandatory)] [string]$BundlePath)
     $plist = Join-Path $BundlePath 'Contents/Info.plist'
     if (-not (Test-Path -LiteralPath $plist)) { return '' }
-    $id = Invoke-Tool plutil @('-extract', 'CFBundleIdentifier', 'raw', '-o', '-', $plist) -Tolerant
+    $id = plutil -extract CFBundleIdentifier raw -o - $plist 2>$null
+    if ($LASTEXITCODE -ne 0) { return '' }
     return "$id".Trim()
 }
 
@@ -625,36 +653,48 @@ function Invoke-LibraryMove {
 function Invoke-LibraryRestore {
     # Reverse of Invoke-LibraryMove: walk the app's folder under the volume's
     # App Library root and move each entry back to its ~/Library location,
-    # replacing the symlinks left there. Real entries at home are never clobbered.
-    # Returns the number of entries restored.
+    # replacing the symlinks left there. The tree holds two shapes: a top-level
+    # entry named after the app is the whole ~/Library/<app> dir (single level);
+    # any other top-level dir is a group (Application Support, Caches, ...) whose
+    # children map to ~/Library/<group>/<child>. Real entries at home are never
+    # clobbered. Returns the number of entries restored.
     param(
         [Parameter(Mandatory)] [string]$AppName,
         [Parameter(Mandatory)] [string]$LibRoot
     )
     if (-not (Test-Path -LiteralPath $LibRoot)) { return 0 }
     $restored = 0
-    foreach ($group in @(Get-ChildItem -LiteralPath $LibRoot -Directory)) {
-        foreach ($item in @(Get-ChildItem -LiteralPath $group.FullName)) {
-            $homePath = Join-Path "$HOME/Library/$($group.Name)" $item.Name
-            $existing = Get-Item -LiteralPath $homePath -Force -ErrorAction SilentlyContinue
-            if ($existing) {
-                if ($existing.LinkType -eq 'SymbolicLink') {
-                    Remove-Item -LiteralPath $homePath -Force
-                } else {
-                    Write-Caution "keeping ~/Library/$($group.Name)/$($item.Name) - a real entry replaced the symlink"
-                    continue
-                }
+    $restoreEntry = {
+        param([string]$VolumeEntry, [string]$HomePath)
+        $existing = Get-Item -LiteralPath $HomePath -Force -ErrorAction SilentlyContinue
+        if ($existing) {
+            if ($existing.LinkType -eq 'SymbolicLink') {
+                Remove-Item -LiteralPath $HomePath -Force
+            } else {
+                Write-Caution "keeping $HomePath - a real entry replaced the link"
+                return $false
             }
-            $null = [System.IO.Directory]::CreateDirectory((Split-Path $homePath -Parent))
-            try {
-                Invoke-Tool mv @($item.FullName, $homePath)
-            } catch {
-                Write-Caution "could not restore ~/Library/$($group.Name)/$($item.Name): $_"
-                continue
-            }
-            $restored++
         }
-        if (-not (Get-ChildItem -LiteralPath $group.FullName -Force)) { Remove-Item -LiteralPath $group.FullName -Force }
+        $null = [System.IO.Directory]::CreateDirectory((Split-Path $HomePath -Parent))
+        try {
+            Invoke-Tool mv @($VolumeEntry, $HomePath)
+        } catch {
+            Write-Caution "could not restore ${HomePath}: $_"
+            return $false
+        }
+        return $true
+    }
+    foreach ($top in @(Get-ChildItem -LiteralPath $LibRoot -Force)) {
+        if (-not $top.PSIsContainer) { continue }
+        if ($top.Name -eq $AppName) {
+            if (& $restoreEntry $top.FullName (Join-Path "$HOME/Library" $top.Name)) { $restored++ }
+            continue
+        }
+        foreach ($item in @(Get-ChildItem -LiteralPath $top.FullName -Force)) {
+            if (-not $item.PSIsContainer) { continue }
+            if (& $restoreEntry $item.FullName (Join-Path "$HOME/Library/$($top.Name)" $item.Name)) { $restored++ }
+        }
+        if (-not (Get-ChildItem -LiteralPath $top.FullName -Force)) { Remove-Item -LiteralPath $top.FullName -Force }
     }
     if (-not (Get-ChildItem -LiteralPath $LibRoot -Force)) { Remove-Item -LiteralPath $LibRoot -Force }
     return $restored
@@ -943,6 +983,191 @@ function Invoke-Restore {
     }
 }
 
+function Get-MoveAudit {
+    # Audit every moved app for partial or broken relocations and return one
+    # record per problem app (healthy apps are omitted). A partial move is data
+    # the current candidate set would relocate but that stayed local (typical
+    # for apps moved before the candidate set grew, e.g. Mozilla's top-level
+    # ~/Library/<app> dir); also caught: dangling bundle or library symlinks,
+    # volume entries orphaned from their home link, and moved apps now on the
+    # locked tiers (the Mozilla fresh-profile trap).
+    $records = @()
+    foreach ($app in @(Get-MovedApp)) {
+        $name = $app.Name
+        $problems = @()
+        $partial = @()
+        $orphans = @()
+        $broken = @()
+        try {
+            $bundleOk = Test-Path -LiteralPath $app.Target
+            if (-not $bundleOk) {
+                $problems += "bundle target is missing: $($app.Target)"
+            }
+            $libRoot = Join-Path (Split-Path (Split-Path $app.Target -Parent) -Parent) "App Library/$name"
+
+            # home side: candidates that stayed local, or link to nothing
+            $bundleId = $bundleOk ? (Get-AppBundleIdentifier $app.Target) : ''
+            foreach ($rel in (Get-AppLibraryRelPath -AppName $name -BundleId $bundleId)) {
+                # $home is a read-only automatic variable - hence $homePath
+                $homePath = Join-Path "$HOME/Library" $rel
+                if (-not (Test-Path -LiteralPath $homePath)) { continue }
+                $item = Get-Item -LiteralPath $homePath -Force
+                if ($item.LinkType) {
+                    $targetPath = @($item.Target)[0]
+                    if (-not (Test-Path -LiteralPath $targetPath)) {
+                        $broken += $homePath
+                        $problems += "dangling link: ~/Library/$rel"
+                    }
+                } else {
+                    $kb = 0
+                    $first = & du -sk $homePath 2>$null | Select-Object -First 1
+                    if ("$first" -match '^(\d+)') { $kb = [long]$Matches[1] }
+                    $partial += [pscustomobject]@{ Path = $homePath; SizeKb = $kb }
+                    $problems += "still local: ~/Library/$rel"
+                }
+            }
+
+            # volume side: entries whose home path vanished entirely; a top-level
+            # entry named after the app is a whole ~/Library/<app> dir, anything
+            # else is a group whose children map to ~/Library/<group>/<child>
+            foreach ($top in @(Get-ChildItem -LiteralPath $libRoot -Force -ErrorAction SilentlyContinue)) {
+                if (-not $top.PSIsContainer) { continue }
+                if ($top.Name -eq $name) {
+                    $homePath = Join-Path "$HOME/Library" $top.Name
+                    if (Test-Path -LiteralPath $homePath) { continue }
+                    $orphans += [pscustomobject]@{ Home = $homePath; Volume = $top.FullName }
+                    $problems += "on the volume without a home link: ~/Library/$($top.Name)"
+                    continue
+                }
+                foreach ($entry in @(Get-ChildItem -LiteralPath $top.FullName -Force -ErrorAction SilentlyContinue)) {
+                    if (-not $entry.PSIsContainer) { continue }
+                    $homePath = Join-Path "$HOME/Library/$($top.Name)" $entry.Name
+                    if (Test-Path -LiteralPath $homePath) { continue }
+                    $orphans += [pscustomobject]@{ Home = $homePath; Volume = $entry.FullName }
+                    $problems += "on the volume without a home link: ~/Library/$($top.Name)/$($entry.Name)"
+                }
+            }
+
+            $tier = Get-MoveTier $name
+            if ($tier -in 'caution', 'avoid') {
+                $problems += "on the $tier list while moved - the app may misbehave from the volume (Mozilla apps come up with a fresh profile; only reverting restores the original install path)"
+            }
+        } catch {
+            $problems += "audit failed (volume unreadable?): $_"
+        }
+        if ($problems.Count -gt 0) {
+            $records += [pscustomobject]@{
+                Name     = $name
+                Link     = $app.LinkPath
+                Target   = $app.Target
+                LibRoot  = Join-Path (Split-Path (Split-Path $app.Target -Parent) -Parent) "App Library/$name"
+                Problems = $problems
+                Partial  = $partial
+                Orphans  = $orphans
+                Broken   = $broken
+                Tier     = Get-MoveTier $name
+            }
+        }
+    }
+    # no comma-wrap: the caller collects with @(), and a comma here would nest
+    return $records
+}
+
+function Invoke-Doctor {
+    # Show every partial or broken relocation, then fix each app in the chosen
+    # direction: complete moves the remaining local data to the volume and links
+    # orphaned volume entries home; revert brings the bundle and every volume
+    # entry back to the internal disk. Per-app prompt unless -Direction is given.
+    if ($Direction -and $Direction -notin 'complete', 'revert') {
+        Write-Failure "-Direction must be 'complete' or 'revert' (got '$Direction')."
+        exit 2
+    }
+    $records = @(Get-MoveAudit)
+    if ($records.Count -eq 0) {
+        Write-Info 'all moved apps are consistent - nothing to fix.'
+        return
+    }
+
+    foreach ($record in $records) {
+        Write-Host ''
+        Write-Host "$($PSStyle.Bold)$($record.Name)$($PSStyle.Reset)"
+        foreach ($problem in $record.Problems) { Write-Host "  - $problem" }
+        if ($record.Partial.Count -gt 0) {
+            $sum = ($record.Partial | Measure-Object -Property SizeKb -Sum).Sum
+            Write-Host "  completing would move $(Format-Size $sum) to the volume"
+        }
+        if ($record.Tier -in 'caution', 'avoid') {
+            Write-Caution '  reverting restores the original install path; completing does not -'
+            Write-Caution '  a locked-tier app keeps misbehaving from the volume until reverted.'
+        }
+    }
+
+    if (-not $Direction -and [Console]::IsInputRedirected) {
+        Write-Host ''
+        Write-Failure 'fixes need a direction - re-run in a terminal, or pass -Direction complete or -Direction revert.'
+        exit 2
+    }
+
+    $fixed = 0
+    $skipped = 0
+    $bundlesReverted = 0
+    foreach ($record in $records) {
+        Write-Host ''
+        $choice = $Direction
+        if (-not $choice) {
+            $answer = (Read-Host "$($record.Name): complete / revert / skip? [c/r/s]").Trim().ToLower()
+            $choice = $answer -in 'c', 'complete' ? 'complete' : $answer -in 'r', 'revert' ? 'revert' : 'skip'
+        }
+        if ($choice -eq 'skip') {
+            $skipped++
+            continue
+        }
+        if ($choice -eq 'complete') {
+            if (-not (Test-Path -LiteralPath $record.Target)) {
+                Write-Failure "$($record.Name): the bundle is gone from the volume - only revert (or reinstall) can fix this."
+                $skipped++
+                continue
+            }
+            $libMoved = 0
+            if ($record.Partial.Count -gt 0) {
+                $libMoved = Invoke-LibraryMove -AppName $record.Name -BundlePath $record.Target -LibRoot $record.LibRoot
+            }
+            foreach ($orphan in $record.Orphans) {
+                $null = [System.IO.Directory]::CreateDirectory((Split-Path $orphan.Home -Parent))
+                $null = Invoke-Tool ln @('-s', $orphan.Volume, $orphan.Home)
+                $libMoved++
+            }
+            Write-Info "$($record.Name): completed$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')."
+            $fixed++
+        } else {
+            # revert: bundle first, then library entries, then clean dangling links
+            if (Test-Path -LiteralPath $record.Target) {
+                Remove-Item -LiteralPath $record.Link
+                Invoke-Tool mv @($record.Target, $record.Link)
+                $bundlesReverted++
+            } else {
+                Remove-Item -LiteralPath $record.Link
+                Write-Caution "$($record.Name): volume bundle was gone - removed the dangling symlink only."
+            }
+            foreach ($dangling in $record.Broken) { Remove-Item -LiteralPath $dangling -Force }
+            $libRestored = Invoke-LibraryRestore -AppName $record.Name -LibRoot $record.LibRoot
+            Write-Info "$($record.Name): reverted$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')."
+            $fixed++
+        }
+    }
+
+    if ($bundlesReverted -gt 0) {
+        Write-Host ''
+        Write-Info 'refreshing LaunchServices, Dock, and Finder...'
+        $null = Invoke-Tool $LsRegister @('-kill', '-r', '-domain', 'local', '-domain', 'system', '-domain', 'user') -Tolerant
+        $null = Invoke-Tool killall @('Dock') -Tolerant
+        $null = Invoke-Tool killall @('Finder') -Tolerant
+    }
+    Write-Host ''
+    Write-Info "doctored $fixed app(s), skipped $skipped."
+    if ($fixed -eq 0 -and $records.Count -gt 0) { exit 1 }
+}
+
 function Invoke-Refresh {
     if (-not $AppName) { Show-Usage }
     $appFile = Resolve-AppName $AppName
@@ -982,6 +1207,7 @@ switch ($Command) {
     'restore' { Invoke-Restore }
     'list'    { Show-MovableList }
     'status'  { Show-Status }
+    'doctor'  { Invoke-Doctor }
     'refresh' { Invoke-Refresh }
     'help'    { Show-Usage }
     default {
