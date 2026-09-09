@@ -7,11 +7,13 @@
 .DESCRIPTION
     Single command wrapping the full app-relocation workflow:
 
-      move [app] [destination]   Copy the .app bundle to external storage with ditto,
-                                 replace the original with a symlink, clear quarantine,
-                                 keep the original signature (re-signing ad-hoc only
-                                 when the copy broke it), and re-register with
-                                 LaunchServices.
+      move [app] [destination]   Copy the .app bundle to external storage (a
+                                 full-fidelity copy that preserves the app's
+                                 signature and metadata), replace the original with
+                                 a symlink, clear macOS's quarantine flag if present,
+                                 keep the app's original signature (re-signing
+                                 locally only when the copy broke it), and
+                                 re-register the app with macOS.
                                  The app's ~/Library footprint (Application Support,
                                  Caches, Logs, WebKit, HTTPStorages, Saved Application
                                  State) moves to the volume's 'App Library' folder too,
@@ -346,8 +348,8 @@ Commands:
                             entries - back to the internal disk.
   list                      Show installed apps categorised by move safety.
   status                    Show apps already moved to external storage.
-  refresh <app>             Refresh LaunchServices, Dock, Finder, and Spotlight
-                            for a moved app.
+  refresh <app>             Refresh the app's macOS registration, Dock, Finder,
+                            and Spotlight for a moved app.
   doctor                    Audit moved apps for partial or broken relocations,
                             then fix each in the direction you choose:
                             complete = move remaining local data to the volume,
@@ -1201,11 +1203,11 @@ function Invoke-BundleMove {
     Write-Info "symlink back at $Src"
 
     # ditto preserves bundle structure, metadata, extended attributes, and forks
-    Write-Info 'copying the bundle with ditto...'
+    Write-Info 'copying the bundle to the volume...'
     try {
         Invoke-Tool ditto @($Src, $dst)
     } catch {
-        Write-Failure "ditto copy failed: $_"
+        Write-Failure "could not copy the bundle to the volume: $_"
         # the partial copy is ours and the original is intact; trash it - on
         # the destination's own volume the Trash is a same-volume rename
         # (macOS keeps a per-volume .Trashes), so this stays cheap - with an
@@ -1218,11 +1220,11 @@ function Invoke-BundleMove {
 
     Write-Info 'removing the original (to the Trash)...'
     if (-not (Invoke-Trash @($Src))) {
-        Write-Caution 'trash failed - falling back to rm (a bundle is re-downloadable; the volume copy is kept if this fails too)...'
+        Write-Caution 'trash failed - falling back to a permanent delete (a bundle can always be re-downloaded; the volume copy is kept if this fails too)...'
         try {
             Invoke-Tool rm @('-rf', $Src)
         } catch {
-            Write-Caution 'plain removal failed - retrying with sudo (password may be asked)...'
+            Write-Caution 'permanent delete failed - retrying with administrator privileges (password may be asked)...'
             try {
                 Invoke-Tool sudo @('rm', '-rf', $Src)
             } catch {
@@ -1253,7 +1255,7 @@ function Invoke-BundleMove {
     $verifyOutput = codesign --verify $dst 2>&1
     if ($LASTEXITCODE -ne 0) {
         $reason = (($verifyOutput | Out-String).Trim() -replace '\s+', ' ')
-        Write-Caution "the original signature did not survive the copy ($reason) - re-signing ad-hoc; TCC grants (removable volumes, screen capture, ...) will need re-approval"
+        Write-Caution "the original signature did not survive the copy ($reason) - re-signing it locally instead; macOS will ask again for permissions this app already had (removable volumes, screen recording, ...)"
         try {
             Invoke-Tool codesign @('--force', '--deep', '--sign', '-', $dst)
         } catch {
@@ -1261,7 +1263,7 @@ function Invoke-BundleMove {
         }
     }
 
-    Write-Info 're-registering with LaunchServices...'
+    Write-Info 're-registering the app with macOS...'
     $null = Invoke-Tool $LsRegister @('-f', $dst) -Tolerant
 
     # Mozilla-family apps: repoint profiles.ini at the existing profile so the
@@ -1493,7 +1495,7 @@ function Invoke-Restore {
     Write-Host ''
     if ($restored -gt 0) {
         Write-Info "restored $restored app(s), skipped $skipped, failed $failed."
-        Write-Info 'refreshing LaunchServices, Dock, and Finder...'
+        Write-Info 'refreshing the macOS app database, Dock, and Finder...'
         $null = Invoke-Tool $LsRegister @('-kill', '-r', '-domain', 'local', '-domain', 'system', '-domain', 'user') -Tolerant
         $null = Invoke-Tool killall @('Dock') -Tolerant
         $null = Invoke-Tool killall @('Finder') -Tolerant
@@ -1536,7 +1538,7 @@ function Get-MoveAudit {
                     $targetPath = @($item.Target)[0]
                     if (-not (Test-Path -LiteralPath $targetPath)) {
                         $broken += $homePath
-                        $problems += "dangling link: ~/Library/$rel"
+                        $problems += "broken link (its target is gone): ~/Library/$rel"
                     }
                 } else {
                     $partial += [pscustomobject]@{ Path = $homePath; SizeKb = (Get-PathSizeKb @($homePath)) }
@@ -1727,7 +1729,7 @@ function Invoke-Doctor {
 
     if ($bundlesReverted -gt 0) {
         Write-Host ''
-        Write-Info 'refreshing LaunchServices, Dock, and Finder...'
+        Write-Info 'refreshing the macOS app database, Dock, and Finder...'
         $null = Invoke-Tool $LsRegister @('-kill', '-r', '-domain', 'local', '-domain', 'system', '-domain', 'user') -Tolerant
         $null = Invoke-Tool killall @('Dock') -Tolerant
         $null = Invoke-Tool killall @('Finder') -Tolerant
@@ -1752,7 +1754,7 @@ function Invoke-Refresh {
     }
     Write-Info "refreshing $appFile at $realPath"
 
-    Write-Info 're-registering with LaunchServices...'
+    Write-Info 're-registering the app with macOS...'
     $null = Invoke-Tool $LsRegister @('-f', $realPath) -Tolerant
 
     if ($ForceRepair) {
@@ -1762,7 +1764,7 @@ function Invoke-Refresh {
         $verifyOutput = codesign --verify $realPath 2>&1
         if ($LASTEXITCODE -ne 0) {
             $reason = (($verifyOutput | Out-String).Trim() -replace '\s+', ' ')
-            Write-Caution "signature check failed ($reason) - re-signing ad-hoc; TCC grants (removable volumes, screen capture, ...) will need re-approval"
+            Write-Caution "signature check failed ($reason) - re-signing it locally instead; macOS will ask again for permissions this app already had (removable volumes, screen recording, ...)"
             try {
                 Invoke-Tool codesign @('--force', '--deep', '--sign', '-', $realPath)
             } catch {
