@@ -17,14 +17,23 @@
                                  The app's ~/Library footprint (Application Support,
                                  Caches, Logs, WebKit, HTTPStorages, Saved Application
                                  State) moves to the volume's 'App Library' folder too,
-                                 symlinked back. With no app given, a full-height
+                                 symlinked back. When both a local and a volume copy
+                                 of an entry exist, the live/newer copy is kept
+                                 automatically only when clearly safe (identical
+                                 snapshots or a clearly staler leftover); two divergent
+                                 copies stop that entry and ask which to keep.
+                                 With no app given, a full-height
                                  interactive multiselect lists every installed app
                                  with tier colours, sizes, the paths a move would
                                  relocate, and a live selected-total footer.
                                  When the destination is omitted, the command asks
                                  where the app should go, offering mounted volumes.
       restore                    Move every externally-stored app - and its ~/Library
-                                 entries - back to the internal disk.
+                                 entries - back to the internal disk. Entries where
+                                 real data reappeared at home resolve the same
+                                 two-copy conflict: identical or clearly staler
+                                 copies resolve automatically (recoverably), divergent
+                                 copies ask which to keep.
       list                       Show installed apps categorised by how safe they
                                  are to move, with sizes and totals.
       status                     Show apps already moved to external storage.
@@ -345,7 +354,10 @@ Commands:
                             avoid list apps are locked in the multiselect and
                             refused when named.
   restore                   Move every externally-stored app - and its ~/Library
-                            entries - back to the internal disk.
+                            entries - back to the internal disk. Entries where real
+                            data reappeared at home resolve the same two-copy
+                            conflict: identical or clearly staler copies resolve
+                            automatically (recoverably), divergent copies ask.
   list                      Show installed apps categorised by move safety.
   status                    Show apps already moved to external storage.
   refresh <app>             Refresh the app's macOS registration, Dock, Finder,
@@ -914,6 +926,69 @@ function Get-PathSizeKb {
     return $total
 }
 
+function Show-TreeTime {
+    # Human-readable 'last change' for a unix timestamp; 'unknown' when 0.
+    param([Parameter(Mandatory)] [long]$Epoch)
+    if ($Epoch -le 0) { return 'unknown' }
+    return [DateTimeOffset]::FromUnixTimeSeconds($Epoch).LocalDateTime.ToString('yyyy-MM-dd HH:mm')
+}
+
+function Get-TreeInfo {
+    # @{ SizeKb; NewestFileEpoch } for a directory tree - metadata reads only,
+    # so it costs seconds even for very large data.
+    param([Parameter(Mandatory)] [string]$Path)
+    $epochs = & find @($Path, '-type', 'f', '-exec', 'stat', '-f', '%m', '{}', '+') 2>$null
+    $newest = 0L
+    foreach ($line in @($epochs)) {
+        if ("$line" -match '^(\d+)$' -and [long]$Matches[1] -gt $newest) { $newest = [long]$Matches[1] }
+    }
+    return @{ SizeKb = (Get-PathSizeKb @($Path)); NewestFileEpoch = $newest }
+}
+
+function Resolve-DataConflict {
+    # Both a local and a volume copy of one library entry exist. The local side
+    # is the live one - these call sites only run while no symlink is in place,
+    # so the app has been writing to the local copy. Decides which copy keeps:
+    #   the local copy wins automatically only when clearly safe - both sides
+    #   are the same snapshot (last changes within 5 minutes) or the volume
+    #   copy is clearly staler (a day or more behind);
+    #   anything else is divergent, and the choice belongs to the user: the
+    #   volume copy hugely larger (the husk of an old failed removal), newer
+    #   than the live side, or both sides recently active in different ways.
+    #   Interactive runs choose local / volume / skip with sizes, last changes,
+    #   and the live side shown; non-interactive runs are refused with the
+    #   same summary. Returns 'local' | 'volume' | 'skip'.
+    param(
+        [Parameter(Mandatory)] [string]$LocalPath,
+        [Parameter(Mandatory)] [string]$VolumePath,
+        [Parameter(Mandatory)] [string]$Label
+    )
+    $local = Get-TreeInfo $LocalPath
+    $volume = Get-TreeInfo $VolumePath
+    $sameSnapshot = [Math]::Abs($local.NewestFileEpoch - $volume.NewestFileEpoch) -le 300
+    $volumeStaler = ($local.NewestFileEpoch - $volume.NewestFileEpoch) -ge 86400
+    $huskShaped = $volume.SizeKb -gt ($local.SizeKb * 5)
+    $volumeNewer = ($volume.NewestFileEpoch -gt $local.NewestFileEpoch) -and -not $sameSnapshot
+    if (-not $huskShaped -and -not $volumeNewer -and ($sameSnapshot -or $volumeStaler)) {
+        Write-Caution "${Label}: two copies exist - keeping the local one (live, $(Format-Size $local.SizeKb), last change $(Show-TreeTime $local.NewestFileEpoch)); the volume copy ($(Format-Size $volume.SizeKb), last change $(Show-TreeTime $volume.NewestFileEpoch)) moves to the Trash - recoverable until the Trash is emptied."
+        return 'local'
+    }
+    $summary = @(
+        "${Label}: two different-looking copies exist - which one should keep?"
+        "  local  - $(Format-Size $local.SizeKb), last change $(Show-TreeTime $local.NewestFileEpoch) (the app is currently using this one)"
+        "  volume - $(Format-Size $volume.SizeKb), last change $(Show-TreeTime $volume.NewestFileEpoch)"
+    ) -join "`n"
+    if ([Console]::IsInputRedirected) {
+        Write-Caution $summary
+        Write-Caution "${Label}: left untouched - re-run in a terminal to choose."
+        return 'skip'
+    }
+    Write-Host ''
+    Write-Host $summary
+    $answer = (Read-Host 'Keep which copy? local / volume / skip [l/v/s]').Trim().ToLower()
+    return $answer -in 'l', 'local' ? 'local' : $answer -in 'v', 'volume' ? 'volume' : 'skip'
+}
+
 function Get-AppSize {
     # Parallel du over each app's relocatable paths; returns a name-to-KiB hashtable.
     # du reads only directory metadata, so even multi-GB bundles size in milliseconds.
@@ -978,30 +1053,41 @@ function Invoke-LibraryMove {
             $stage = 'copy'
             [void][System.IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
             # a leftover at the destination would make ditto merge into it, so
-            # stale files would survive a re-move. The intact local original is
-            # authoritative, so clear the leftover first - but refuse when it
-            # is far larger than the local data: that is the husk of an old
-            # failed removal, where the leftover may be the only complete copy
-            # and neither side gets touched.
+            # stale files would survive a re-move - when both sides hold data,
+            # Resolve-DataConflict decides which copy keeps (the live/newer one
+            # wins automatically only when clearly safe; divergent copies ask)
             if (Test-Path -LiteralPath $dest) {
                 $destItem = Get-Item -LiteralPath $dest -Force
                 if ($destItem.LinkType) {
                     # a stale link - removing it never touches its target
                     Remove-Item -LiteralPath $dest -Force
                 } else {
-                    $srcKb = Get-PathSizeKb @($libPath)
-                    $dstKb = Get-PathSizeKb @($dest)
-                    if ($dstKb -gt ($srcKb * 5)) {
-                        Write-Caution "~/Library/${rel}: the volume already holds a larger copy ($(Format-Size $dstKb)) than the local data ($(Format-Size $srcKb)) - it may be the only complete one, so neither side is touched. Inspect `"$dest`" and `"$libPath`"; if the volume copy is the good one, trash `"$libPath`" and move `"$dest`" to `"$libPath`" by hand."
+                    $verdict = Resolve-DataConflict -LocalPath $libPath -VolumePath $dest -Label "~/Library/$rel"
+                    if ($verdict -eq 'skip') {
                         $failed++
+                        continue
+                    }
+                    if ($verdict -eq 'volume') {
+                        # the volume copy is the keeper: the local copy moves to
+                        # the Trash and the link takes its place. Stage 'link':
+                        # the surviving data is complete and local is in the
+                        # Trash, so a failure here means only the link is missing.
+                        if (-not (Invoke-Trash @($libPath))) {
+                            Write-Caution "~/Library/${rel}: could not trash the local copy - nothing was changed, the volume copy is untouched."
+                            $failed++
+                            continue
+                        }
+                        $stage = 'link'
+                        Invoke-Tool ln @('-s', $dest, $libPath)
+                        Write-Info "~/Library/${rel}: keeping the volume copy - the local copy is in the Trash (recoverable until the Trash is emptied)."
+                        $moved++
                         continue
                     }
                     if (-not (Invoke-Trash @($dest))) {
-                        Write-Caution "~/Library/${rel}: could not clear the leftover copy at the destination - skipping (the original is untouched)."
+                        Write-Caution "~/Library/${rel}: could not clear the volume copy - skipping (the local copy is untouched)."
                         $failed++
                         continue
                     }
-                    Write-Caution "~/Library/${rel}: cleared a leftover copy at $(($dest -replace [regex]::Escape($HOME), '~'))."
                 }
             }
             Write-Info "moving ~/Library/$rel"
@@ -1081,8 +1167,41 @@ function Invoke-LibraryRestore {
             if ($existing.LinkType -eq 'SymbolicLink') {
                 Remove-Item -LiteralPath $HomePath -Force
             } else {
-                Write-Caution "keeping $HomePath - a real entry replaced the link"
-                return $false
+                # both sides hold data - decide which copy keeps (live/newer
+                # wins automatically only when clearly safe; divergent copies
+                # ask local / volume / skip)
+                $label = $HomePath -replace [regex]::Escape($HOME), '~'
+                $verdict = Resolve-DataConflict -LocalPath $HomePath -VolumePath $VolumeEntry -Label $label
+                if ($verdict -eq 'skip') { return $false }
+                if ($verdict -eq 'volume') {
+                    # the volume copy wins: replace the local data with it
+                    if (-not (Invoke-Trash @($HomePath))) {
+                        Write-Caution "could not clear $label for the volume copy - both copies are untouched."
+                        return $false
+                    }
+                    try {
+                        Invoke-Tool ditto @($VolumeEntry, $HomePath)
+                    } catch {
+                        Write-Caution "could not restore ${label}: $_"
+                        # clear the partial copy just started (home held nothing
+                        # real once the local original was trashed) - the local
+                        # original sits in the Trash and the volume copy is intact
+                        $null = Invoke-Trash @($HomePath)
+                        return $false
+                    }
+                    if (-not (Invoke-Trash @($VolumeEntry))) {
+                        Write-Caution "restored $label, but the volume original could not be trashed - move it to the Trash by hand"
+                    }
+                    Write-Info "kept the volume copy for $label (the previous local copy is in the Trash, recoverable until the Trash is emptied)."
+                    return $true
+                }
+                # verdict 'local': the home copy wins - the volume side retires
+                if (-not (Invoke-Trash @($VolumeEntry))) {
+                    Write-Caution "kept the local copy at $label - but the volume copy could not be trashed, so it stays on the volume"
+                    return $false
+                }
+                Write-Info "kept the local copy for $label (the volume copy is in the Trash, recoverable until the Trash is emptied)."
+                return $true
             }
         }
         $null = [System.IO.Directory]::CreateDirectory((Split-Path $HomePath -Parent))
