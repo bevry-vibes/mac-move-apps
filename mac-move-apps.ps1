@@ -546,6 +546,259 @@ function Get-AppBundleIdentifier {
     return "$id".Trim()
 }
 
+# Port of Mozilla's vendored CityHash v1 (other-licenses/nsis/Contrib/CityHash/cityhash),
+# compiled lazily by Get-MozillaInstallHash. Verified to reproduce the install hashes
+# observed in this machine's Thunderbird profiles.ini.
+$CityHashSource = @'
+using System;
+using System.Text;
+
+public static class CityHash {
+    const ulong K0 = 0xc3a5c85c97cb3127UL;
+    const ulong K1 = 0xb492b66fbe98f273UL;
+    const ulong K2 = 0x9ae16a3b2f90404fUL;
+    const ulong K3 = 0xc949d7c7509e6557UL;
+    const ulong KMul = 0x9ddfea08eb382d69UL;
+
+    static ulong Load64(byte[] s, int i) { return BitConverter.ToUInt64(s, i); }
+    static uint Load32(byte[] s, int i) { return BitConverter.ToUInt32(s, i); }
+    static ulong Rotate(ulong val, int shift) {
+        return shift == 0 ? val : ((val >> shift) | (val << (64 - shift)));
+    }
+    static ulong RotateByAtLeast1(ulong val, int shift) {
+        return (val >> shift) | (val << (64 - shift));
+    }
+    static ulong ShiftMix(ulong val) { return val ^ (val >> 47); }
+    static ulong HashLen16(ulong u, ulong v) {
+        ulong a = (u ^ v) * KMul;
+        a ^= a >> 47;
+        ulong b = (v ^ a) * KMul;
+        b ^= b >> 47;
+        b *= KMul;
+        return b;
+    }
+    static ulong HashLen0to16(byte[] s, int len) {
+        if (len > 8) {
+            ulong a = Load64(s, 0);
+            ulong b = Load64(s, len - 8);
+            return HashLen16(a, RotateByAtLeast1(b + (ulong)len, len)) ^ b;
+        }
+        if (len >= 4) {
+            ulong a = Load32(s, 0);
+            return HashLen16((ulong)len + (a << 3), Load32(s, len - 4));
+        }
+        if (len > 0) {
+            ulong a = s[0];
+            ulong b = s[len >> 1];
+            ulong c = s[len - 1];
+            ulong y = a + (b << 8);
+            ulong z = (ulong)len + (c << 2);
+            return ShiftMix(y * K2 ^ z * K3) * K2;
+        }
+        return K2;
+    }
+    static ulong HashLen17to32(byte[] s, int len) {
+        ulong a = Load64(s, 0) * K1;
+        ulong b = Load64(s, 8);
+        ulong c = Load64(s, len - 8) * K2;
+        ulong d = Load64(s, len - 16) * K0;
+        return HashLen16(Rotate(a - b, 43) + Rotate(c, 30) + d,
+                         a + Rotate(b ^ K3, 20) - c + (ulong)len);
+    }
+    static void WeakHashLen32WithSeeds(byte[] s, int off, ulong a, ulong b, out ulong first, out ulong second) {
+        ulong w = Load64(s, off), x = Load64(s, off + 8), y = Load64(s, off + 16), z = Load64(s, off + 24);
+        a += w;
+        b = Rotate(b + a + z, 21);
+        ulong c = a;
+        a += x;
+        a += y;
+        b += Rotate(a, 44);
+        first = a + z;
+        second = b + c;
+    }
+    static ulong HashLen33to64(byte[] s, int len) {
+        ulong z = Load64(s, 24);
+        ulong a = Load64(s, 0) + ((ulong)len + Load64(s, len - 16)) * K0;
+        ulong b = Rotate(a + z, 52);
+        ulong c = Rotate(a, 37);
+        a += Load64(s, 8);
+        c += Rotate(a, 7);
+        a += Load64(s, 16);
+        ulong vf = a + z;
+        ulong vs = b + Rotate(a, 31) + c;
+        a = Load64(s, 16) + Load64(s, len - 32);
+        z = Load64(s, len - 8);
+        b = Rotate(a + z, 52);
+        c = Rotate(a, 37);
+        a += Load64(s, len - 24);
+        c += Rotate(a, 7);
+        a += Load64(s, len - 16);
+        ulong wf = a + z;
+        ulong ws = b + Rotate(a, 31) + c;
+        ulong r = ShiftMix((vf + ws) * K2 + (wf + vs) * K0);
+        return ShiftMix(r * K0 + vs) * K2;
+    }
+    public static ulong Hash64(byte[] s) {
+        int len = s.Length;
+        if (len <= 32) {
+            if (len <= 16) return HashLen0to16(s, len);
+            return HashLen17to32(s, len);
+        }
+        if (len <= 64) return HashLen33to64(s, len);
+        ulong x = Load64(s, 0);
+        ulong y = Load64(s, len - 16) ^ K1;
+        ulong z = Load64(s, len - 56) ^ K0;
+        ulong vFirst, vSecond, wFirst, wSecond;
+        WeakHashLen32WithSeeds(s, len - 64, (ulong)len, y, out vFirst, out vSecond);
+        WeakHashLen32WithSeeds(s, len - 32, (ulong)len * K1, K0, out wFirst, out wSecond);
+        z += ShiftMix(vSecond) * K1;
+        x = Rotate(z + x, 39) * K1;
+        y = Rotate(y, 33) * K1;
+        int remaining = (len - 1) & ~63;
+        int off = 0;
+        do {
+            x = Rotate(x + y + vFirst + Load64(s, off + 16), 37) * K1;
+            y = Rotate(y + vSecond + Load64(s, off + 48), 42) * K1;
+            x ^= wSecond;
+            y ^= vFirst;
+            z = Rotate(z ^ wFirst, 33);
+            ulong nvFirst, nvSecond, nwFirst, nwSecond;
+            WeakHashLen32WithSeeds(s, off, vSecond * K1, x + wFirst, out nvFirst, out nvSecond);
+            WeakHashLen32WithSeeds(s, off + 32, z + wSecond, y, out nwFirst, out nwSecond);
+            vFirst = nvFirst; vSecond = nvSecond; wFirst = nwFirst; wSecond = nwSecond;
+            ulong tmp = z; z = x; x = tmp;
+            off += 64;
+            remaining -= 64;
+        } while (remaining != 0);
+        return HashLen16(HashLen16(vFirst, wFirst) + ShiftMix(y) * K1 + z,
+                         HashLen16(vSecond, wSecond) + x);
+    }
+    public static string InstallHash(string installDirPath) {
+        // UTF-16 code units, native endianness - matches the char16_t bytes
+        // Mozilla hashes (little-endian on Apple Silicon and Intel)
+        return Hash64(Encoding.Unicode.GetBytes(installDirPath)).ToString("X");
+    }
+}
+'@
+
+function Get-MozillaInstallHash {
+    # Mozilla's per-installation identifier: CityHash64 over the UTF-16LE bytes
+    # of the bundle's Contents/MacOS directory path (nsXREDirProvider::GetInstallHash
+    # + GetInstallHash in commonupdatedir.cpp), uppercase hex. This is the <hash>
+    # in profiles.ini's [Install<hash>] sections, so a relocated bundle computes
+    # a different hash and Mozilla apps treat it as a new installation.
+    param([Parameter(Mandatory)] [string]$BundlePath)
+    if (-not ('CityHash' -as [type])) {
+        Add-Type -TypeDefinition $CityHashSource -Language CSharp
+    }
+    return [CityHash]::InstallHash((Join-Path $BundlePath 'Contents/MacOS'))
+}
+
+function Invoke-MozillaRepoint {
+    # After a Mozilla-family app's bundle settles at a new physical path, make the
+    # first launch from there keep the existing profile instead of creating a
+    # fresh one: point the CURRENT install section's Default= at the profile the
+    # app used before the move, in profiles.ini and its sibling installs.ini.
+    # Gate: only apps that actually have a Mozilla-style profiles.ini are touched
+    # (~/Library/<app>/profiles.ini or ~/Library/Application Support/<app>/profiles.ini).
+    # The original is kept once as <ini>.bak-mac-move-apps. Returns $true when a
+    # file was rewritten.
+    param(
+        [Parameter(Mandatory)] [string]$AppName,
+        [Parameter(Mandatory)] [string]$BundlePath
+    )
+    $iniPath = @(
+        (Join-Path "$HOME/Library" "$AppName/profiles.ini")
+        (Join-Path "$HOME/Library/Application Support" "$AppName/profiles.ini")
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $iniPath) { return $false }   # not a Mozilla-style app - nothing to do
+
+    $currentHash = Get-MozillaInstallHash $BundlePath
+    $lines = [System.IO.File]::ReadAllLines($iniPath)
+    $section = ''
+    $installDefaults = @{}
+    $profilePaths = @{}
+    $defaultProfileFlag = ''
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[(.+)\]\s*$') { $section = $Matches[1]; continue }
+        if ($line -notmatch '^\s*(\w+)\s*=\s*(.*?)\s*$') { continue }
+        $key = $Matches[1]
+        $value = $Matches[2]
+        if ($section -like 'Install*' -and $key -eq 'Default') { $installDefaults[$section] = $value }
+        if ($section -match '^Profile\d+$' -and $key -eq 'Path') { $profilePaths[$section] = $value }
+        if ($section -match '^Profile\d+$' -and $key -eq 'Default' -and $value -eq '1') { $defaultProfileFlag = $section }
+    }
+    # pick the profile to repoint to: the existing profile another install used,
+    # preferring the most recently modified; fall back to the [Profile*] marked default
+    $iniDir = Split-Path $iniPath -Parent
+    $best = ''
+    $bestMtime = [datetime]::MinValue
+    foreach ($entry in $installDefaults.GetEnumerator()) {
+        if ($entry.Key -eq "Install$currentHash") { continue }
+        $value = $entry.Value
+        if (-not $value) { continue }
+        $profileDir = $value.StartsWith('/') ? $value : (Join-Path $iniDir $value)
+        if (-not (Test-Path -LiteralPath $profileDir)) { continue }
+        $mtime = (Get-Item -LiteralPath $profileDir).LastWriteTime
+        if ($mtime -gt $bestMtime) { $bestMtime = $mtime; $best = $value }
+    }
+    if (-not $best -and $defaultProfileFlag -and $profilePaths[$defaultProfileFlag]) {
+        $candidate = $profilePaths[$defaultProfileFlag]
+        $profileDir = $candidate.StartsWith('/') ? $candidate : (Join-Path $iniDir $candidate)
+        if (Test-Path -LiteralPath $profileDir) { $best = $candidate }
+    }
+    if (-not $best) {
+        Write-Caution "found $iniPath but no previous default profile to point at - leaving it alone."
+        return $false
+    }
+
+    $targets = @($iniPath)
+    $installsIni = Join-Path $iniDir 'installs.ini'
+    if (Test-Path -LiteralPath $installsIni) { $targets += $installsIni }
+    foreach ($file in $targets) {
+        $bak = "$file.bak-mac-move-apps"
+        if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $file -Destination $bak }
+        $list = [System.Collections.Generic.List[string]]::new()
+        foreach ($l in [System.IO.File]::ReadAllLines($file)) { $list.Add($l) }
+        $sectionHeader = "Install$currentHash"
+        $start = -1
+        for ($i = 0; $i -lt $list.Count; $i++) {
+            if ($list[$i] -match ('^\s*\[' + [regex]::Escape($sectionHeader) + '\]\s*$')) { $start = $i; break }
+        }
+        if ($start -ge 0) {
+            # rewrite Default (and Locked) inside the existing section
+            $end = $list.Count
+            for ($i = $start + 1; $i -lt $list.Count; $i++) {
+                if ($list[$i] -match '^\s*\[') { $end = $i; break }
+            }
+            $defaultIdx = -1
+            $lockedIdx = -1
+            for ($i = $start + 1; $i -lt $end; $i++) {
+                if ($list[$i] -match '^\s*Default\s*=') { $defaultIdx = $i }
+                if ($list[$i] -match '^\s*Locked\s*=') { $lockedIdx = $i }
+            }
+            if ($defaultIdx -ge 0) {
+                $list[$defaultIdx] = "Default=$best"
+            } else {
+                $list.Insert($start + 1, "Default=$best")
+                if ($lockedIdx -ge 0) { $lockedIdx++ }
+            }
+            if ($lockedIdx -lt 0) {
+                $list.Insert($start + 2, 'Locked=1')
+            }
+        } else {
+            # the app has not run from this path yet - create its section
+            if ($list.Count -gt 0 -and $list[$list.Count - 1] -ne '') { $list.Add('') }
+            $list.Add("[$sectionHeader]")
+            $list.Add("Default=$best")
+            $list.Add('Locked=1')
+        }
+        [System.IO.File]::WriteAllText($file, ($list -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+        Write-Info "repointed [$sectionHeader] Default=$best in $(($file -replace [regex]::Escape($HOME), '~'))"
+    }
+    return $true
+}
+
 function Get-AppLibraryRelPath {
     # The ~/Library-relative paths this tool relocates for an app: the top-level
     # app-named dir (where Mozilla keeps Thunderbird's data), by bundle name, and
@@ -791,6 +1044,10 @@ function Invoke-BundleMove {
 
     Write-Info 're-registering with LaunchServices...'
     $null = Invoke-Tool $LsRegister @('-f', $dst) -Tolerant
+
+    # Mozilla-family apps: repoint profiles.ini at the existing profile so the
+    # first launch from the volume does not present a fresh install
+    $null = Invoke-MozillaRepoint -AppName $name -BundlePath $dst
 
     # relocate the app's ~/Library footprint next to the bundle on the volume;
     # skipped for root-level destinations, which have no sensible sibling spot
@@ -1050,7 +1307,7 @@ function Get-MoveAudit {
 
             $tier = Get-MoveTier $name
             if ($tier -in 'caution', 'avoid') {
-                $problems += "on the $tier list while moved - Mozilla apps pick their default profile by install path, so a volume-moved app starts fresh; revert fixes it automatically, or re-point Default= in the app's profiles.ini to keep it on the volume"
+                $problems += "on the $tier list while moved - Mozilla apps pick their default profile by install path, so a volume-moved app starts fresh; revert fixes it automatically, and doctor's complete re-points the app's profiles.ini at the existing profile"
             }
         } catch {
             $problems += "audit failed (volume unreadable?): $_"
@@ -1098,7 +1355,7 @@ function Invoke-Doctor {
         }
         if ($record.Tier -in 'caution', 'avoid') {
             Write-Caution '  reverting restores the original install path and fixes profile selection;'
-            Write-Caution '  to keep it on the volume instead, re-point Default= in the app''s profiles.ini.'
+            Write-Caution '  completing re-points the app''s profiles.ini at its existing profile automatically.'
         }
     }
 
@@ -1128,6 +1385,12 @@ function Invoke-Doctor {
                 $skipped++
                 continue
             }
+            $null = pgrep -f ([regex]::Escape("$($record.Target)/"))
+            if ($LASTEXITCODE -eq 0) {
+                Write-Caution "$($record.Name): the app is running from the volume - quit it before completing."
+                $skipped++
+                continue
+            }
             $libMoved = 0
             if ($record.Partial.Count -gt 0) {
                 $libMoved = Invoke-LibraryMove -AppName $record.Name -BundlePath $record.Target -LibRoot $record.LibRoot
@@ -1137,6 +1400,9 @@ function Invoke-Doctor {
                 $null = Invoke-Tool ln @('-s', $orphan.Volume, $orphan.Home)
                 $libMoved++
             }
+            # Mozilla-family apps: repoint profiles.ini at the existing profile so
+            # the next launch from the volume keeps it instead of starting fresh
+            $null = Invoke-MozillaRepoint -AppName $record.Name -BundlePath $record.Target
             Write-Info "$($record.Name): completed$(($libMoved -gt 0) ? " (+$libMoved ~/Library entries)" : '')."
             $fixed++
         } else {
