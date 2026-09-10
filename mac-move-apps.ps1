@@ -28,12 +28,12 @@
                                  relocate, and a live selected-total footer.
                                  When the destination is omitted, the command asks
                                  where the app should go, offering mounted volumes.
-      restore                    Move every externally-stored app - and its ~/Library
-                                 entries - back to the internal disk. Entries where
-                                 real data reappeared at home resolve the same
-                                 two-copy conflict: identical or clearly staler
-                                 copies resolve automatically (recoverably), divergent
-                                 copies ask which to keep.
+      restore [app]              Move every externally-stored app - or just the named
+                                 one - and its ~/Library entries back to the internal
+                                 disk. Entries where real data reappeared at home
+                                 resolve the same two-copy conflict: identical or
+                                 clearly staler copies resolve automatically
+                                 (recoverably), divergent copies ask which to keep.
       list                       Show installed apps categorised by how safe they
                                  are to move, with sizes and totals.
       status                     Show apps already moved to external storage.
@@ -126,7 +126,8 @@ $AppAliases = @{
 # Curated move-safety tiers, audited against the apps installed on this machine.
 # These are enforced, not advisory: caution and avoid apps cannot be moved.
 #   avoid   - installs drivers, system/network extensions, root helpers, or launchd
-#             services; or patches the system (Apple pro media apps included).
+#             services; or patches the system (Apple pro media apps included); or
+#             known-broken when moved (Orion fails to work at all from a volume).
 #   caution - relies on integration that references its install path or keys
 #             permissions to it (browser native messaging, accessibility/TCC grants,
 #             driver installers, App Store Apple apps, terminals, and the Mozilla
@@ -145,7 +146,7 @@ $MoveTiers = [ordered]@{
         'KeepingYouAwake', 'KeyCastr', 'keyviz', 'Lapce', 'Libation', 'LocalSend',
         'Menu Bar Controller for Sonos 2', 'Meta', 'Microsoft Edge', 'Mole',
         'MongoDB Compass', 'Motrix', 'mux', 'Numi', 'ONLYOFFICE', 'Open WebUI',
-        'OpenAudible', 'Openscreen', 'Orion', 'PDFgear', 'Pearcleaner', 'Plezy',
+        'OpenAudible', 'Openscreen', 'PDFgear', 'Pearcleaner', 'Plezy',
         'Plex', 'Plexamp', 'Prologue', 'Proton Mail Uninstaller', 'Proton Meet',
         'Quiet', 'Radix', 'Readest', 'Revu', 'Script Debugger', 'Shazam', 'Shop',
         'Shortcut Remote', 'Signal', 'Sketch', 'Sorted³', 'SpotiFLAC-Next',
@@ -167,7 +168,7 @@ $MoveTiers = [ordered]@{
         'Adguard', 'Audio Hijack', 'Backblaze', 'BackblazeRestore', 'Compressor',
         'Compressor Creator Studio', 'DaVinci Resolve', 'Docker', 'ExpressVPN',
         'Final Cut Pro', 'iMovie', 'Karabiner-Elements', 'lghub', 'Loopback',
-        'OpenCore-Patcher', 'OrbStack', 'Parallels Desktop', 'Plex Media Server',
+        'OpenCore-Patcher', 'OrbStack', 'Orion', 'Parallels Desktop', 'Plex Media Server',
         'RustDesk', 'Safari', 'SoundSource', 'Syncthing', 'Tailscale',
         'VMware Fusion', 'Xcode'
     )
@@ -353,11 +354,12 @@ Commands:
                             .app suffix optional) or a bundle path. Caution and
                             avoid list apps are locked in the multiselect and
                             refused when named.
-  restore                   Move every externally-stored app - and its ~/Library
-                            entries - back to the internal disk. Entries where real
-                            data reappeared at home resolve the same two-copy
-                            conflict: identical or clearly staler copies resolve
-                            automatically (recoverably), divergent copies ask.
+  restore [app]             Move every externally-stored app - or just the named
+                            one - and its ~/Library entries back to the internal
+                            disk. Entries where real data reappeared at home
+                            resolve the same two-copy conflict: identical or
+                            clearly staler copies resolve automatically
+                            (recoverably), divergent copies ask.
   list                      Show installed apps categorised by move safety.
   status                    Show apps already moved to external storage.
   refresh <app>             Refresh the app's macOS registration, Dock, Finder,
@@ -1544,7 +1546,94 @@ function Restore-OneBundle {
     return $true
 }
 
+function Restore-AppRegistration {
+    # Rebuild macOS's app database so apps stay findable after a move or
+    # restore, and restart Dock and Finder so they pick up the new locations.
+    Write-Info 'refreshing the macOS app database, Dock, and Finder...'
+    $null = Invoke-Tool $LsRegister @('-kill', '-r', '-domain', 'local', '-domain', 'system', '-domain', 'user') -Tolerant
+    $null = Invoke-Tool killall @('Dock') -Tolerant
+    $null = Invoke-Tool killall @('Finder') -Tolerant
+}
+
+function Restore-OneMovedApp {
+    # Restore one moved app: bundle home, then its ~/Library entries, then the
+    # Mozilla profile repoint. Prints its own progress; returns 'restored',
+    # 'failed', or 'skipped'.
+    param([Parameter(Mandatory)] [pscustomobject]$App)
+    Write-Host -NoNewline "  restoring $($App.Name)... "
+    if (-not (Test-Path -LiteralPath $App.Target)) {
+        Write-Host 'missing source'
+        return 'failed'
+    }
+    $linkItem = Get-Item -LiteralPath $App.LinkPath -Force -ErrorAction SilentlyContinue
+    if (-not $linkItem -or $linkItem.LinkType -ne 'SymbolicLink') {
+        Write-Host 'skipped - the home path is no longer a symlink (a real app may have replaced it)'
+        return 'skipped'
+    }
+    if (Test-AppRunning @($App.LinkPath, $App.Target)) {
+        Write-Host 'skipped - the app is running; quit it completely and re-run'
+        return 'skipped'
+    }
+    # Restore-OneBundle prints the trailing 'failed' word itself; nothing
+    # is ever deleted on failure - the volume copy stays reachable
+    if (-not (Restore-OneBundle -LinkPath $App.LinkPath -TargetPath $App.Target)) {
+        return 'failed'
+    }
+    # bring the app's ~/Library entries back from the volume's App Library;
+    # a library failure never fails the restored bundle itself
+    $libRoot = Join-Path (Split-Path (Split-Path $App.Target -Parent) -Parent) "App Library/$($App.Name)"
+    $libRestored = 0
+    try {
+        $libRestored = Invoke-LibraryRestore -AppName $App.Name -LibRoot $libRoot
+    } catch {
+        Write-Caution "  could not restore ~/Library entries for $($App.Name): $_"
+    }
+    # the bundle lives at its home path again - repoint Mozilla profiles.ini
+    # at the home install hash, or the next launch presents a fresh profile
+    $null = Invoke-MozillaRepoint -AppName $App.Name -BundlePath $App.LinkPath
+    Write-Host "done$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')"
+    return 'restored'
+}
+
+function Invoke-RestoreOne {
+    # restore <app>: bring one named app back to the internal disk.
+    $appFile = Resolve-AppName $AppName
+    $name = (Split-Path $appFile -Leaf) -replace '\.app$', ''
+    $app = @(Get-MovedApp) | Where-Object Name -eq $name | Select-Object -First 1
+    if (-not $app) {
+        Write-Failure "$name is not on external storage - nothing to restore (see status)."
+        exit 1
+    }
+    if ($DryRun) {
+        Write-Preview "would restore $name from $($app.Target) - dry run, nothing was moved."
+        return
+    }
+    if (-not $Yes) {
+        if ([Console]::IsInputRedirected) {
+            Write-Failure 'stdin is not interactive - re-run with -Yes to restore without a prompt.'
+            exit 2
+        }
+        $answer = (Read-Host "Restore $name to the internal disk? [y/N]").Trim()
+        if ($answer -notmatch '^[Yy]') {
+            Write-Info 'cancelled.'
+            return
+        }
+    }
+    $verdict = Restore-OneMovedApp $app
+    Write-Host ''
+    if ($verdict -eq 'restored') {
+        Write-Info "restored $name to the internal disk."
+        Restore-AppRegistration
+    } elseif ($verdict -eq 'failed') {
+        Write-Failure "could not restore $name - nothing was lost, the volume copy is still in place."
+        exit 1
+    } else {
+        Write-Info "$name was skipped - nothing was changed."
+    }
+}
+
 function Invoke-Restore {
+    if ($AppName) { Invoke-RestoreOne; return }
     $moved = @(Get-MovedApp)
     if ($moved.Count -eq 0) {
         Write-Info 'no apps are symlinked to external storage - nothing to restore.'
@@ -1572,52 +1661,14 @@ function Invoke-Restore {
     $failed = 0
     $skipped = 0
     foreach ($app in $moved) {
-        Write-Host -NoNewline "  restoring $($app.Name)... "
-        if (-not (Test-Path -LiteralPath $app.Target)) {
-            Write-Host 'missing source'
-            $failed++
-            continue
-        }
-        $linkItem = Get-Item -LiteralPath $app.LinkPath -Force -ErrorAction SilentlyContinue
-        if (-not $linkItem -or $linkItem.LinkType -ne 'SymbolicLink') {
-            Write-Host 'skipped - the home path is no longer a symlink (a real app may have replaced it)'
-            $skipped++
-            continue
-        }
-        if (Test-AppRunning @($app.LinkPath, $app.Target)) {
-            Write-Host 'skipped - the app is running; quit it completely and re-run'
-            $skipped++
-            continue
-        }
-        # Restore-OneBundle prints the trailing 'failed' word itself; nothing
-        # is ever deleted on failure - the volume copy stays reachable
-        if (-not (Restore-OneBundle -LinkPath $app.LinkPath -TargetPath $app.Target)) {
-            $failed++
-            continue
-        }
-        # bring the app's ~/Library entries back from the volume's App Library;
-        # a library failure never fails the restored bundle itself
-        $libRoot = Join-Path (Split-Path (Split-Path $app.Target -Parent) -Parent) "App Library/$($app.Name)"
-        $libRestored = 0
-        try {
-            $libRestored = Invoke-LibraryRestore -AppName $app.Name -LibRoot $libRoot
-        } catch {
-            Write-Caution "  could not restore ~/Library entries for $($app.Name): $_"
-        }
-        # the bundle lives at its home path again - repoint Mozilla profiles.ini
-        # at the home install hash, or the next launch presents a fresh profile
-        $null = Invoke-MozillaRepoint -AppName $app.Name -BundlePath $app.LinkPath
-        Write-Host "done$(($libRestored -gt 0) ? " (+$libRestored ~/Library entries)" : '')"
-        $restored++
+        $verdict = Restore-OneMovedApp $app
+        if ($verdict -eq 'restored') { $restored++ } elseif ($verdict -eq 'failed') { $failed++ } else { $skipped++ }
     }
 
     Write-Host ''
     if ($restored -gt 0) {
         Write-Info "restored $restored app(s), skipped $skipped, failed $failed."
-        Write-Info 'refreshing the macOS app database, Dock, and Finder...'
-        $null = Invoke-Tool $LsRegister @('-kill', '-r', '-domain', 'local', '-domain', 'system', '-domain', 'user') -Tolerant
-        $null = Invoke-Tool killall @('Dock') -Tolerant
-        $null = Invoke-Tool killall @('Finder') -Tolerant
+        Restore-AppRegistration
     } else {
         Write-Failure "restored 0 app(s), skipped $skipped, failed $failed."
     }
@@ -1848,10 +1899,7 @@ function Invoke-Doctor {
 
     if ($bundlesReverted -gt 0) {
         Write-Host ''
-        Write-Info 'refreshing the macOS app database, Dock, and Finder...'
-        $null = Invoke-Tool $LsRegister @('-kill', '-r', '-domain', 'local', '-domain', 'system', '-domain', 'user') -Tolerant
-        $null = Invoke-Tool killall @('Dock') -Tolerant
-        $null = Invoke-Tool killall @('Finder') -Tolerant
+        Restore-AppRegistration
     }
     Write-Host ''
     Write-Info "doctored $fixed app(s), skipped $skipped, failed $failedFixes."
