@@ -1595,14 +1595,105 @@ function Restore-OneMovedApp {
     return 'restored'
 }
 
+function Get-HalfRestoredApp {
+    # Detect a half-finished restore: the app's bundle is back home as a real
+    # folder, but some of its ~/Library entries are still symlinks into a
+    # volume's App Library (a restore that was interrupted partway, e.g. by a
+    # permission denial). Returns the moved-app shape plus LibRoot, or $null.
+    param([Parameter(Mandatory)] [string]$Name)
+    $homeBundle = $null
+    foreach ($dir in $SearchDirs) {
+        $candidate = Join-Path $dir "$Name.app"
+        if (Test-Path -LiteralPath $candidate) {
+            $item = Get-Item -LiteralPath $candidate
+            if (-not $item.LinkType) { $homeBundle = $item.FullName; break }
+        }
+    }
+    if (-not $homeBundle) { return $null }
+    $bundleId = Get-AppBundleIdentifier $homeBundle
+    $libRoot = ''
+    foreach ($rel in (Get-AppLibraryRelPath -AppName $Name -BundleId $bundleId)) {
+        $homePath = Join-Path "$HOME/Library" $rel
+        if (-not (Test-Path -LiteralPath $homePath)) { continue }
+        $item = Get-Item -LiteralPath $homePath -Force
+        if ($item.LinkType -ne 'SymbolicLink') { continue }
+        $target = @($item.Target)[0]
+        if ($target -notlike '/Volumes/*') { continue }
+        $marker = "/App Library/$Name/"
+        $cut = $target.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($cut -lt 0) { continue }
+        $libRoot = $target.Substring(0, $cut + $marker.Length - 1)
+        break
+    }
+    if (-not $libRoot) { return $null }
+    $volumeRoot = Split-Path (Split-Path $libRoot -Parent) -Parent
+    return [pscustomobject]@{
+        Name     = $Name
+        LinkPath = $homeBundle
+        Target   = Join-Path (Join-Path $volumeRoot 'Applications') "$Name.app"
+        LibRoot  = $libRoot
+    }
+}
+
+function Invoke-RestoreHalf {
+    # Finish a half-restored app: bring the still-linked ~/Library entries
+    # home and retire the leftover volume bundle copy.
+    param([Parameter(Mandatory)] [pscustomobject]$Half)
+    $name = $Half.Name
+    if ($DryRun) {
+        Write-Preview "would finish restoring $name from $(($Half.LibRoot -replace [regex]::Escape($HOME), '~')) - dry run, nothing was moved."
+        return
+    }
+    if (-not $Yes) {
+        if ([Console]::IsInputRedirected) {
+            Write-Failure 'stdin is not interactive - re-run with -Yes to restore without a prompt.'
+            exit 2
+        }
+        $answer = (Read-Host "Finish restoring $name to the internal disk? [y/N]").Trim()
+        if ($answer -notmatch '^[Yy]') {
+            Write-Info 'cancelled.'
+            return
+        }
+    }
+    $libRestored = 0
+    try {
+        $libRestored = Invoke-LibraryRestore -AppName $name -LibRoot $Half.LibRoot
+    } catch {
+        Write-Caution "could not read the volume copy of ${name}: $_"
+    }
+    if (Test-Path -LiteralPath $Half.Target) {
+        if (Invoke-Trash @($Half.Target)) {
+            Write-Info 'leftover volume copy of the app moved to the Trash.'
+        } else {
+            Write-Caution "could not trash the leftover volume copy - move it to the Trash by hand: $($Half.Target)"
+        }
+    }
+    $null = Invoke-MozillaRepoint -AppName $name -BundlePath $Half.LinkPath
+    Write-Host ''
+    if ($libRestored -gt 0) {
+        Write-Info "finished restoring $name - all of its data is on the internal disk now."
+        Restore-AppRegistration
+    } else {
+        Write-Failure "nothing could be restored for $name - the volume data could not be read from this terminal. Run this command from a terminal that can access the volume (the one that did the original move)."
+        exit 1
+    }
+}
+
 function Invoke-RestoreOne {
-    # restore <app>: bring one named app back to the internal disk.
+    # restore <app>: bring one named app back to the internal disk - either a
+    # currently-moved app, or a half-finished restore (bundle already home,
+    # data still linked to the volume).
     $appFile = Resolve-AppName $AppName
     $name = (Split-Path $appFile -Leaf) -replace '\.app$', ''
     $app = @(Get-MovedApp) | Where-Object Name -eq $name | Select-Object -First 1
     if (-not $app) {
-        Write-Failure "$name is not on external storage - nothing to restore (see status)."
-        exit 1
+        $half = Get-HalfRestoredApp -Name $name
+        if (-not $half) {
+            Write-Failure "$name is not on external storage - nothing to restore (see status)."
+            exit 1
+        }
+        Invoke-RestoreHalf -Half $half
+        return
     }
     if ($DryRun) {
         Write-Preview "would restore $name from $($app.Target) - dry run, nothing was moved."
