@@ -1216,8 +1216,10 @@ function Invoke-LibraryRestore {
             $null = Invoke-Trash @($HomePath)
             return $false
         }
-        if (-not (Invoke-Trash @($VolumeEntry))) {
-            Write-Caution "restored $HomePath, but the volume original could not be trashed - move `"$VolumeEntry`" to the Trash by hand"
+        if (Invoke-Trash @($VolumeEntry)) {
+            Write-Info "brought back $(($HomePath -replace [regex]::Escape($HOME), '~')) - its volume copy moved to the Trash (a duplicate now that the data is home)."
+        } else {
+            Write-Caution "brought back $(($HomePath -replace [regex]::Escape($HOME), '~')), but its volume copy could not be trashed - move `"$VolumeEntry`" to the Trash by hand"
         }
         return $true
     }
@@ -1663,15 +1665,14 @@ function Invoke-RestoreHalf {
     }
     if (Test-Path -LiteralPath $Half.Target) {
         if (Invoke-Trash @($Half.Target)) {
-            Write-Info 'leftover volume copy of the app moved to the Trash.'
+            Write-Info "removed the leftover volume copy $($Half.Target) - the app is home now, so it was a duplicate (recoverable from the Trash)."
         } else {
             Write-Caution "could not trash the leftover volume copy - move it to the Trash by hand: $($Half.Target)"
         }
     }
     $null = Invoke-MozillaRepoint -AppName $name -BundlePath $Half.LinkPath
-    Write-Host ''
     if ($libRestored -gt 0) {
-        Write-Info "finished restoring $name - all of its data is on the internal disk now."
+        Write-Info "finished restoring $name - $libRestored data folder(s) back on the internal disk."
         Restore-AppRegistration
     } else {
         Write-Failure "nothing could be restored for $name - the volume data could not be read from this terminal. Run this command from a terminal that can access the volume (the one that did the original move)."
