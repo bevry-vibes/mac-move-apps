@@ -127,7 +127,8 @@ $AppAliases = @{
 # These are enforced, not advisory: caution and avoid apps cannot be moved.
 #   avoid   - installs drivers, system/network extensions, root helpers, or launchd
 #             services; or patches the system (Apple pro media apps included); or
-#             known-broken when moved (Orion fails to work at all from a volume).
+#             verified broken when moved (Orion and Jellyfin both stop running
+#             from a volume, even though the launch path is symlinked).
 #   caution - relies on integration that references its install path or keys
 #             permissions to it (browser native messaging, accessibility/TCC grants,
 #             driver installers, App Store Apple apps, terminals, and the Mozilla
@@ -142,7 +143,7 @@ $MoveTiers = [ordered]@{
         'ChatGPT', 'Claude', 'DBeaver', 'Discord', 'draw.io', 'Duplicate File Finder',
         'eero', 'Endel', 'Flighty', 'FreeCAD', 'GIMP', 'GitHub Copilot',
         'GitHub Desktop', 'GoPro Player', 'Google Chrome', 'Hidden Bar', 'IINA',
-        'Insta360 Studio', 'Inkscape', 'Jellyfin', 'Kagi Search', 'Kamusku',
+        'Insta360 Studio', 'Inkscape', 'Kagi Search', 'Kamusku',
         'KeepingYouAwake', 'KeyCastr', 'keyviz', 'Lapce', 'Libation', 'LocalSend',
         'Menu Bar Controller for Sonos 2', 'Meta', 'Microsoft Edge', 'Mole',
         'MongoDB Compass', 'Motrix', 'mux', 'Numi', 'ONLYOFFICE', 'Open WebUI',
@@ -167,7 +168,7 @@ $MoveTiers = [ordered]@{
     avoid = @(
         'Adguard', 'Audio Hijack', 'Backblaze', 'BackblazeRestore', 'Compressor',
         'Compressor Creator Studio', 'DaVinci Resolve', 'Docker', 'ExpressVPN',
-        'Final Cut Pro', 'iMovie', 'Karabiner-Elements', 'lghub', 'Loopback',
+        'Final Cut Pro', 'iMovie', 'Jellyfin', 'Karabiner-Elements', 'lghub', 'Loopback',
         'OpenCore-Patcher', 'OrbStack', 'Orion', 'Parallels Desktop', 'Plex Media Server',
         'RustDesk', 'Safari', 'SoundSource', 'Syncthing', 'Tailscale',
         'VMware Fusion', 'Xcode'
