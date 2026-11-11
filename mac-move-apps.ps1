@@ -17,8 +17,11 @@
                                  The app's ~/Library footprint (Application Support,
                                  Caches, Logs, WebKit, HTTPStorages, Saved Application
                                  State) moves to the volume's 'App Library' folder too,
-                                 symlinked back. When both a local and a volume copy
-                                 of an entry exist, the live/newer copy is kept
+                                 symlinked back. A .app already at the destination is
+                                 deduplicated automatically - the newer copy (version,
+                                 then last change) keeps, the stale one goes to the
+                                 Trash. When both a local and a volume copy of a
+                                 ~/Library entry exist, the live/newer copy is kept
                                  automatically only when clearly safe (identical
                                  snapshots or a clearly staler leftover); two divergent
                                  copies stop that entry and ask which to keep.
@@ -49,7 +52,8 @@
                                  its signature is broken.
 
     The move-safety tiers are enforced, not advisory: apps on the caution or avoid
-    lists are locked in the multiselect and refused by direct move.
+    lists are locked in the multiselect and refused by direct move (a stale
+    volume duplicate is still cleaned up, leaving the app local).
 
     Apps are searched for in /Applications and ~/Applications.
 
@@ -140,7 +144,7 @@ $MoveTiers = [ordered]@{
         '0 A.D.', 'ABDownloadManager', 'Actions', 'Amazon Kindle', 'Android Studio',
         'AnythingLLM', 'Aural', 'Audacity', 'balenaEtcher', 'Beeper Desktop', 'Bible',
         'Blender', 'Brave Browser', 'BusyCal', 'BusyContacts', 'Byword', 'calibre',
-        'ChatGPT', 'Claude', 'DBeaver', 'Discord', 'draw.io', 'Duplicate File Finder',
+        'ChatGPT', 'Claude', 'Cursor', 'DBeaver', 'Discord', 'draw.io', 'Duplicate File Finder',
         'eero', 'Endel', 'Flighty', 'FreeCAD', 'GIMP', 'GitHub Copilot',
         'GitHub Desktop', 'GoPro Player', 'Google Chrome', 'Hidden Bar', 'IINA',
         'Insta360 Studio', 'Inkscape', 'Kagi Search', 'Kamusku',
@@ -294,6 +298,18 @@ function Get-MovedApp {
     }
 }
 
+function Get-VolumeDuplicate {
+    # The same-named bundle in an external volume's Applications dir, if any.
+    # Used to clean up a duplicate left behind when an app update replaced a
+    # move symlink with a real bundle at the original path.
+    param([Parameter(Mandatory)] [string]$AppFile)
+    foreach ($volume in @(Get-ExternalVolume)) {
+        $candidate = Join-Path (Join-Path $volume.Mount 'Applications') $AppFile
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
+}
+
 function Get-ExternalVolume {
     # Mounted volumes under /Volumes that are real df mount points - the startup
     # volume's /Volumes entry fails the mount-point check, external drives pass it.
@@ -352,9 +368,13 @@ Commands:
                             interactive multiselect lists every installed app.
                             Asks where the app(s) should go when the destination
                             is omitted. The app is a name (aliases supported,
-                            .app suffix optional) or a bundle path. Caution and
-                            avoid list apps are locked in the multiselect and
-                            refused when named.
+                            .app suffix optional) or a bundle path. A .app
+                            already at the destination is deduplicated
+                            automatically: the newer copy (version, then last
+                            change) keeps, the stale one goes to the Trash.
+                            Caution and avoid list apps are locked in the
+                            multiselect and refused when named, though a stale
+                            volume duplicate is still cleaned up (app stays local).
   restore [app]             Move every externally-stored app - or just the named
                             one - and its ~/Library entries back to the internal
                             disk. Entries where real data reappeared at home
@@ -371,7 +391,8 @@ Commands:
                             revert = move the app back to the internal disk.
 
 Options:
-  -Force        move: overwrite an existing app at the destination.
+  -Force        move: overwrite an existing app at the destination even when
+                it is newer (duplicates normally resolve automatically).
   -DryRun       restore: preview what would move, change nothing.
   -Yes          restore: skip the confirmation prompt.
   -ForceRepair  refresh: also clear quarantine and re-sign the app when its
@@ -1246,8 +1267,47 @@ function Invoke-LibraryRestore {
     return $restored
 }
 
+function Get-BundleVersion {
+    # Best-effort bundle version for duplicate resolution: the short version,
+    # then the build version. '' when the plist is unreadable.
+    param([Parameter(Mandatory)] [string]$BundlePath)
+    $plist = Join-Path $BundlePath 'Contents/Info.plist'
+    if (-not (Test-Path -LiteralPath $plist)) { return '' }
+    foreach ($key in @('CFBundleShortVersionString', 'CFBundleVersion')) {
+        $value = plutil -extract $key raw -o - $plist 2>$null
+        if ($LASTEXITCODE -eq 0 -and "$value".Trim()) { return "$value".Trim() }
+    }
+    return ''
+}
+
+function Compare-BundleFreshness {
+    # Which copy of a duplicated .app is the keeper: 'source' (the local copy
+    # being moved) or 'destination' (the volume copy already there). Versions
+    # decide when both parse; otherwise the bundle's last change does, with the
+    # source winning ties. .app duplication is always resolved automatically -
+    # only duplicated config/data can require asking the user.
+    param(
+        [Parameter(Mandatory)] [string]$Source,
+        [Parameter(Mandatory)] [string]$Destination
+    )
+    $sourceVersion = Get-BundleVersion $Source
+    $destinationVersion = Get-BundleVersion $Destination
+    $sourceParsed = $null
+    $destinationParsed = $null
+    $sourceOk = [version]::TryParse($sourceVersion, [ref]$sourceParsed)
+    $destinationOk = [version]::TryParse($destinationVersion, [ref]$destinationParsed)
+    if ($sourceOk -and $destinationOk -and $sourceParsed -ne $destinationParsed) {
+        return ($sourceParsed -gt $destinationParsed) ? 'source' : 'destination'
+    }
+    $sourceChanged = (Get-Item -LiteralPath $Source).LastWriteTimeUtc
+    $destinationChanged = (Get-Item -LiteralPath $Destination).LastWriteTimeUtc
+    return ($destinationChanged -gt $sourceChanged) ? 'destination' : 'source'
+}
+
 function Invoke-BundleMove {
     # Move one resolved, pre-checked bundle into DestDir and symlink it back.
+    # A bundle already at the destination is deduplicated automatically: the
+    # newer copy (version, then last change) keeps, the other goes to the Trash.
     # Returns $true on success; reports its own failures.
     param(
         [Parameter(Mandatory)] [string]$Src,
@@ -1285,6 +1345,7 @@ function Invoke-BundleMove {
     # the app's ~/Library data. Case-sensitive on purpose: -ceq, because a
     # lower-case '/volumes/...' path is a legitimate destination, not /Volumes
     $rootDest = ($destParent -ceq '/' -or $destParent -ceq '/Volumes')
+    $useVolumeCopy = $false
 
     try {
         # .NET call: literal path creation, unlike New-Item's wildcard-mangled -Path
@@ -1297,25 +1358,42 @@ function Invoke-BundleMove {
                     Invoke-Tool rm @('-rf', $dst)
                 }
             } else {
-                Write-Failure "destination already exists: $dst (re-run with -Force to overwrite)"
-                return $false
+                # a duplicate .app is self-resolving: the newest copy keeps and
+                # the stale one goes to the Trash - never ask about this
+                $keeper = Compare-BundleFreshness -Source $Src -Destination $dst
+                $sourceVersion = Get-BundleVersion $Src
+                $destinationVersion = Get-BundleVersion $dst
+                $sourceLabel = $sourceVersion ? $sourceVersion : 'unknown version'
+                $destinationLabel = $destinationVersion ? $destinationVersion : 'unknown version'
+                if ($keeper -eq 'destination') {
+                    Write-Info "duplicate app: the volume copy is newer ($destinationLabel vs $sourceLabel) - keeping it and symlinking $Src to it."
+                    $useVolumeCopy = $true
+                } else {
+                    Write-Info "duplicate app: the local copy is newer ($sourceLabel vs $destinationLabel) - replacing the stale volume copy automatically."
+                    if (-not (Invoke-Trash @($dst))) {
+                        Write-Caution 'could not move the stale volume copy to the Trash - deleting it (an app bundle is re-downloadable).'
+                        Invoke-Tool rm @('-rf', $dst)
+                    }
+                }
             }
         }
 
-        # refuse moves that cannot fit: a mid-copy disk-full failure is the
-        # classic way relocation tools lose data, and du + df are metadata
-        # reads, so this costs milliseconds even for multi-GB apps
-        $relocatable = @(Get-AppRelocatable $Src)
-        $needKb = Get-PathSizeKb ($rootDest ? @($relocatable[0]) : $relocatable)
-        $dfRow = (df -k $DestDir | Select-Object -Skip 1) -split '\s+'
-        $freeKb = [long]$dfRow[3]
-        $mount = ($dfRow[5..($dfRow.Count - 1)] -join ' ').Trim()
-        if ($mount -eq '/' -or $mount -eq '/System/Volumes/Data') {
-            Write-Caution "$DestDir is on the internal disk - the move frees no internal space."
-        }
-        if ($freeKb -lt [Math]::Ceiling($needKb * 1.05)) {
-            Write-Failure "not enough space on ${DestDir}: $(Format-Size $needKb) to move, $(Format-Size $freeKb) free - nothing was copied."
-            return $false
+        if (-not $useVolumeCopy) {
+            # refuse moves that cannot fit: a mid-copy disk-full failure is the
+            # classic way relocation tools lose data, and du + df are metadata
+            # reads, so this costs milliseconds even for multi-GB apps
+            $relocatable = @(Get-AppRelocatable $Src)
+            $needKb = Get-PathSizeKb ($rootDest ? @($relocatable[0]) : $relocatable)
+            $dfRow = (df -k $DestDir | Select-Object -Skip 1) -split '\s+'
+            $freeKb = [long]$dfRow[3]
+            $mount = ($dfRow[5..($dfRow.Count - 1)] -join ' ').Trim()
+            if ($mount -eq '/' -or $mount -eq '/System/Volumes/Data') {
+                Write-Caution "$DestDir is on the internal disk - the move frees no internal space."
+            }
+            if ($freeKb -lt [Math]::Ceiling($needKb * 1.05)) {
+                Write-Failure "not enough space on ${DestDir}: $(Format-Size $needKb) to move, $(Format-Size $freeKb) free - nothing was copied."
+                return $false
+            }
         }
     } catch {
         Write-Failure "cannot prepare the destination: $_"
@@ -1326,23 +1404,25 @@ function Invoke-BundleMove {
     Write-Info "   to $dst"
     Write-Info "symlink back at $Src"
 
-    # ditto preserves bundle structure, metadata, extended attributes, and forks
-    Write-Info 'copying the bundle to the volume...'
-    try {
-        Invoke-Tool ditto @($Src, $dst)
-    } catch {
-        Write-Failure "could not copy the bundle to the volume: $_"
-        # the partial copy is ours and the original is intact; trash it - on
-        # the destination's own volume the Trash is a same-volume rename
-        # (macOS keeps a per-volume .Trashes), so this stays cheap - with an
-        # rm fallback, since a bundle is re-downloadable
-        if (-not (Invoke-Trash @($dst))) {
-            $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
+    if (-not $useVolumeCopy) {
+        # ditto preserves bundle structure, metadata, extended attributes, and forks
+        Write-Info 'copying the bundle to the volume...'
+        try {
+            Invoke-Tool ditto @($Src, $dst)
+        } catch {
+            Write-Failure "could not copy the bundle to the volume: $_"
+            # the partial copy is ours and the original is intact; trash it - on
+            # the destination's own volume the Trash is a same-volume rename
+            # (macOS keeps a per-volume .Trashes), so this stays cheap - with an
+            # rm fallback, since a bundle is re-downloadable
+            if (-not (Invoke-Trash @($dst))) {
+                $null = Invoke-Tool rm @('-rf', $dst) -Tolerant
+            }
+            return $false
         }
-        return $false
     }
 
-    Write-Info 'removing the original (to the Trash)...'
+    Write-Info 'removing the local copy (to the Trash)...'
     if (-not (Invoke-Trash @($Src))) {
         Write-Caution 'trash failed - falling back to a permanent delete (a bundle can always be re-downloaded; the volume copy is kept if this fails too)...'
         try {
@@ -1352,9 +1432,10 @@ function Invoke-BundleMove {
             try {
                 Invoke-Tool sudo @('rm', '-rf', $Src)
             } catch {
-                # the copy is never deleted here: a half-finished removal leaves
-                # the original damaged and the copy as the only complete version
-                Write-Failure "could not remove the original: $_"
+                # the volume copy is never deleted here: a half-finished removal
+                # leaves the local copy damaged and the volume copy as the only
+                # complete version
+                Write-Failure "could not remove the local copy: $_"
                 Write-Caution "kept the copy at $dst - move `"$Src`" to the Trash (or rm -rf it), then: ln -s `"$dst`" `"$Src`""
                 return $false
             }
@@ -1505,6 +1586,26 @@ function Invoke-Move {
     }
     $tier = Get-MoveTier $name
     if ($tier -in 'caution', 'avoid') {
+        # a locked app must stay local, but a stale volume duplicate from an
+        # interrupted/upgraded move is still removable - newest local copy wins
+        $duplicate = Get-VolumeDuplicate $appFile
+        if ($duplicate) {
+            if ((Compare-BundleFreshness -Source $src -Destination $duplicate) -eq 'source') {
+                $sourceVersion = Get-BundleVersion $src
+                $destinationVersion = Get-BundleVersion $duplicate
+                $sourceLabel = $sourceVersion ? $sourceVersion : 'unknown version'
+                $destinationLabel = $destinationVersion ? $destinationVersion : 'unknown version'
+                Write-Caution "$name is on the $tier list - moving it is disabled; the local copy is newer ($sourceLabel vs $destinationLabel), so removing the stale volume copy instead (the app stays in /Applications)."
+                if (-not (Invoke-Trash @($duplicate))) {
+                    Write-Failure "could not move the stale volume copy to the Trash: $duplicate"
+                    exit 1
+                }
+                Write-Info "removed the stale volume copy: $duplicate"
+                return
+            }
+            Write-Caution "$name is on the $tier list - moving it is disabled, and the volume copy is newer than the local copy - nothing was changed."
+            exit 1
+        }
         Write-Failure "$name is on the $tier list - moving it is disabled."
         exit 1
     }
