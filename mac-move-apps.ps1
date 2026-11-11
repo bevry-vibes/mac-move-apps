@@ -50,6 +50,11 @@
                                  Dock, Finder, and Spotlight; -ForceRepair also
                                  clears quarantine and re-signs the app only when
                                  its signature is broken.
+      uninstall <app>            Uninstall a Homebrew-managed app (cask), optionally
+                                 removing its data. Refuses apps Homebrew does not
+                                 own. A moved app's external bundle is cleaned up
+                                 too; data is kept unless -Data remove (or you
+                                 answer yes at the prompt).
 
     The move-safety tiers are enforced, not advisory: apps on the caution or avoid
     lists are locked in the multiselect and refused by direct move (a stale
@@ -93,6 +98,9 @@
 
 .EXAMPLE
     pwsh -File ./mac-move-apps.ps1 refresh IINA -ForceRepair
+
+.EXAMPLE
+    pwsh -File ./mac-move-apps.ps1 uninstall IINA -Data keep -Yes
 #>
 [CmdletBinding()]
 param(
@@ -103,7 +111,8 @@ param(
     [switch]$DryRun,
     [switch]$Yes,
     [switch]$ForceRepair,
-    [ValidateSet('', 'complete', 'revert')][string]$Direction = ''
+    [ValidateSet('', 'complete', 'revert')][string]$Direction = '',
+    [ValidateSet('', 'keep', 'remove')][string]$Data = ''
 )
 
 Set-StrictMode -Version Latest
@@ -275,6 +284,97 @@ function Resolve-AppBundle {
     return $null
 }
 
+function Resolve-AppForUninstall {
+    # Like Resolve-AppBundle, but tolerates a dangling symlink: cleaning up the
+    # link left behind by a broken move is a legitimate reason to uninstall.
+    param([Parameter(Mandatory)] [string]$AppFile)
+    if ($AppFile -match '/') {
+        $candidate = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AppFile)
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+        return $item ? $item.FullName : $null
+    }
+    foreach ($dir in $SearchDirs) {
+        $candidate = Join-Path $dir $AppFile
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+        if ($item) { return $item.FullName }
+    }
+    return $null
+}
+
+function Get-CaskroomPath {
+    # Homebrew's Caskroom: install receipts and staged artifacts live there.
+    $output = & brew --caskroom 2>$null
+    if ($LASTEXITCODE -eq 0 -and "$output".Trim()) { return "$output".Trim() }
+    $prefix = & brew --prefix 2>$null
+    if ($LASTEXITCODE -eq 0 -and "$prefix".Trim()) { return (Join-Path "$prefix".Trim() 'Caskroom') }
+    return $null
+}
+
+function Get-BrewCaskToken {
+    # The Homebrew cask that owns an app bundle, or '' when it is not managed.
+    # Only casks with an install receipt are considered. Homebrew keeps a link
+    # from '<token>/<version>/<App>.app' to the installed bundle, which maps the
+    # common case without shelling out per cask. pkg-based casks leave a
+    # '<token>/<version>/<name>.pkg' instead, so they fall back to the cask's
+    # uninstall/delete paths and the package's installed file list.
+    param([Parameter(Mandatory)] [string]$AppPath)
+
+    $caskroom = Get-CaskroomPath
+    if (-not $caskroom -or -not (Test-Path -LiteralPath $caskroom)) { return '' }
+    $installed = @(& brew list --cask 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $installed.Count -eq 0) { return '' }
+
+    $needle = $AppPath.TrimEnd('/')
+    $appFile = Split-Path $needle -Leaf
+    $ordinal = [System.StringComparison]::OrdinalIgnoreCase
+
+    foreach ($token in $installed) {
+        $tokenDir = Join-Path $caskroom $token
+        if (-not (Test-Path -LiteralPath $tokenDir)) { continue }
+        foreach ($candidate in @(Get-ChildItem -LiteralPath $tokenDir -Recurse -Depth 2 -Filter '*.app' -Force -ErrorAction SilentlyContinue)) {
+            $target = ($candidate.LinkType -eq 'SymbolicLink' -and $candidate.Target) ? @($candidate.Target)[0] : $null
+            if ($target -and [string]::Equals($target.TrimEnd('/'), $needle, $ordinal)) { return $token }
+            if (-not $target -and $candidate.Name -ieq $appFile) { return $token }
+        }
+    }
+
+    foreach ($token in $installed) {
+        $tokenDir = Join-Path $caskroom $token
+        if (-not (Test-Path -LiteralPath $tokenDir)) { continue }
+        $pkgs = @(Get-ChildItem -LiteralPath $tokenDir -Recurse -Depth 2 -Filter '*.pkg' -File -Force -ErrorAction SilentlyContinue)
+        if ($pkgs.Count -eq 0) { continue }
+        $json = & brew info --cask --json=v2 $token 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $json) { continue }
+        try { $caskDef = ($json | ConvertFrom-Json).casks[0] } catch { continue }
+        foreach ($group in @($caskDef.artifacts)) {
+            $uninstallProp = $group.PSObject.Properties['uninstall']
+            if (-not $uninstallProp) { continue }
+            foreach ($directive in @($uninstallProp.Value)) {
+                $deleteProp = $directive.PSObject.Properties['delete']
+                if ($deleteProp) {
+                    foreach ($victim in @($deleteProp.Value)) {
+                        if (-not $victim) { continue }
+                        $expanded = ("$victim" -replace '^\$APPDIR', '/Applications').TrimEnd('/')
+                        if ([string]::Equals($expanded, $needle, $ordinal)) { return $token }
+                    }
+                }
+                $pkgutilProp = $directive.PSObject.Properties['pkgutil']
+                if ($pkgutilProp) {
+                    foreach ($id in @($pkgutilProp.Value)) {
+                        if (-not $id) { continue }
+                        $files = @(& pkgutil --files $id 2>$null)
+                        if ($LASTEXITCODE -ne 0) { continue }
+                        foreach ($file in $files) {
+                            if ([string]::Equals($file, $appFile, $ordinal) -or [string]::Equals($file, "Applications/$appFile", $ordinal)) { return $token }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ''
+}
+
 function Get-InstalledApp {
     # Bundles sitting in the search dirs; apps already symlinked elsewhere are skipped.
     foreach ($dir in $SearchDirs) {
@@ -389,16 +489,23 @@ Commands:
                             then fix each in the direction you choose:
                             complete = move remaining local data to the volume,
                             revert = move the app back to the internal disk.
+  uninstall <app>           Uninstall a Homebrew-managed app (cask). Refuses
+                            apps Homebrew does not own. A moved app's external
+                            bundle is cleaned up too; app data is kept unless
+                            -Data remove (or you answer yes at the prompt).
 
 Options:
   -Force        move: overwrite an existing app at the destination even when
                 it is newer (duplicates normally resolve automatically).
-  -DryRun       restore: preview what would move, change nothing.
-  -Yes          restore: skip the confirmation prompt.
+  -DryRun       restore/uninstall: preview what would move or be removed,
+                change nothing.
+  -Yes          restore/uninstall: skip the confirmation prompt.
   -ForceRepair  refresh: also clear quarantine and re-sign the app when its
                 signature is broken (a valid original signature is kept intact).
   -Direction    doctor: 'complete' or 'revert' - apply to every problem app
                 without asking.
+  -Data         uninstall: 'keep' or 'remove' the app's data. Without it, the
+                command asks (non-interactive runs must pass it).
 
 Examples:
   pwsh -File ./mac-move-apps.ps1 move
@@ -408,6 +515,8 @@ Examples:
   pwsh -File ./mac-move-apps.ps1 doctor
   pwsh -File ./mac-move-apps.ps1 doctor -Direction revert
   pwsh -File ./mac-move-apps.ps1 refresh IINA -ForceRepair
+  pwsh -File ./mac-move-apps.ps1 uninstall IINA
+  pwsh -File ./mac-move-apps.ps1 uninstall IINA -Data remove -Yes
 
 Apps are searched for in /Applications and ~/Applications.
 Exit codes: 0 = success, 1 = failure, 2 = usage error.
@@ -2144,19 +2253,154 @@ function Invoke-Refresh {
     Write-Info "refreshed $appFile - try launching it from Spotlight or the Dock."
 }
 
+function Invoke-Uninstall {
+    # uninstall <app>: Homebrew-managed apps only. Refuses anything without a
+    # cask receipt, so this never half-removes an app the tool cannot reinstall.
+    # The cask owns the bundle; this tool owns what it adds on top - the volume
+    # copy of a moved app, and (with data removal) its 'App Library' tree.
+    if (-not $AppName) { Show-Usage }
+    $appFile = Resolve-AppName $AppName
+    $path = Resolve-AppForUninstall $appFile
+    if (-not $path) {
+        Write-Failure "app not found in $($SearchDirs -join ' or '): $appFile"
+        exit 1
+    }
+    $name = (Split-Path $path -Leaf) -replace '\.app$', ''
+    $bundleId = Get-AppBundleIdentifier $path
+    $token = Get-BrewCaskToken -AppPath $path
+    if (-not $token) {
+        Write-Failure "$name is not managed by Homebrew - uninstall only supports cask-managed apps (see: brew list --cask)."
+        exit 1
+    }
+
+    # The move state decides what else has to go: brew removes the /Applications
+    # link but never the bundle on the volume, and never the relocated data.
+    $item = Get-Item -LiteralPath $path -Force
+    $linkTarget = ($item.LinkType -eq 'SymbolicLink' -and $item.Target) ? @($item.Target)[0] : $null
+    $volumeMount = ($linkTarget -and $linkTarget -match '^(/Volumes/[^/]+)/Applications/') ? $Matches[1] : $null
+    $volumeBundle = $volumeMount ? $linkTarget : $null
+    $appLibraryRoot = $volumeMount ? (Join-Path (Join-Path $volumeMount 'App Library') $name) : $null
+    $appLibraryExists = $appLibraryRoot -and (Test-Path -LiteralPath $appLibraryRoot)
+
+    # Data choice: explicit -Data wins; otherwise ask. A redirected stdin must
+    # pass it, so an unattended run can never silently delete data.
+    $removeData = $null
+    if ($Data -eq 'remove') { $removeData = $true }
+    if ($Data -eq 'keep') { $removeData = $false }
+    if ($null -eq $removeData -and -not $DryRun) {
+        if ([Console]::IsInputRedirected) {
+            Write-Failure 'choose whether to remove app data: pass -Data keep or -Data remove.'
+            exit 2
+        }
+        Write-Host ''
+        Write-Host "App data for ${name}:"
+        if ($appLibraryExists) { Write-Host "  $appLibraryRoot" }
+        Write-Host '  the paths this cask lists under zap (Homebrew uninstall --zap)'
+        $answer = (Read-Host 'Remove app data too? [y/N]').Trim()
+        $removeData = $answer -match '^[Yy]'
+    }
+
+    Write-Host ''
+    Write-Host "Uninstall $name (cask $token)"
+    Write-Host "  app     $path$(($volumeBundle) ? " -> $volumeBundle" : '')"
+    if ($null -eq $removeData) {
+        Write-Host '  data    undecided (pass -Data keep or -Data remove)'
+    } elseif ($removeData) {
+        Write-Host "  data    remove$(($appLibraryExists) ? " ($appLibraryRoot + cask zap paths)" : ' (cask zap paths)')"
+    } else {
+        Write-Host '  data    keep'
+    }
+
+    if ($DryRun) {
+        $brewArgs = @('uninstall', '--cask', $token)
+        if ($removeData) { $brewArgs += '--zap' }
+        Write-Preview "would run: brew $($brewArgs -join ' ')"
+        if ($volumeBundle) { Write-Preview "would trash the volume copy: $volumeBundle" }
+        if ($removeData -and $appLibraryExists) { Write-Preview "would trash app data: $appLibraryRoot" }
+        return
+    }
+
+    if (-not $Yes) {
+        if ([Console]::IsInputRedirected) {
+            Write-Failure 'stdin is not interactive - re-run with -Yes to uninstall without a prompt.'
+            exit 2
+        }
+        $answer = (Read-Host "Uninstall $name? [y/N]").Trim()
+        if ($answer -notmatch '^[Yy]') {
+            Write-Info 'cancelled.'
+            return
+        }
+    }
+
+    if (Test-AppRunning @($path)) {
+        Write-Info "quitting $name..."
+        $quitScript = $bundleId ? "tell application id `"$bundleId`" to quit" : "tell application `"$name`" to quit"
+        $null = Invoke-Tool osascript @('-e', $quitScript) -Tolerant
+        Start-Sleep -Seconds 1
+    }
+
+    $brewArgs = @('uninstall', '--cask', $token)
+    if ($removeData) { $brewArgs += '--zap' }
+    Write-Info "running: brew $($brewArgs -join ' ')"
+    try {
+        Invoke-Tool brew $brewArgs | ForEach-Object { Write-Host $_ }
+    } catch {
+        Write-Failure "brew uninstall failed: $_"
+        exit 1
+    }
+
+    $failed = 0
+    if ($volumeBundle -and (Test-Path -LiteralPath $volumeBundle)) {
+        if (Invoke-Trash @($volumeBundle)) {
+            Write-Info "trashed the volume copy: $volumeBundle"
+        } else {
+            $failed++
+        }
+    }
+    if ($removeData -and $appLibraryRoot -and (Test-Path -LiteralPath $appLibraryRoot)) {
+        if (Invoke-Trash @($appLibraryRoot)) {
+            Write-Info "trashed app data: $appLibraryRoot"
+        } else {
+            $failed++
+        }
+    }
+    if ($removeData) {
+        # Drop the ~/Library links that pointed into the removed tree so no
+        # dangling shortcuts stay behind. Only links are removed here: real
+        # local data is never touched (brew's zap owns that).
+        foreach ($rel in (Get-AppLibraryRelPath -AppName $name -BundleId $bundleId)) {
+            $libPath = Join-Path "$HOME/Library" $rel
+            $libItem = Get-Item -LiteralPath $libPath -Force -ErrorAction SilentlyContinue
+            if (-not $libItem -or $libItem.LinkType -ne 'SymbolicLink' -or -not $libItem.Target) { continue }
+            $target = (@($libItem.Target)[0]).TrimEnd('/')
+            if ($appLibraryRoot -and $target.StartsWith("$appLibraryRoot/", [System.StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $libPath -Force
+            }
+        }
+    }
+
+    Write-Host ''
+    if ($failed -gt 0) {
+        Write-Failure "uninstalled $name, but some cleanup paths need attention (see above)."
+        exit 1
+    }
+    Write-Info "uninstalled $name$(($removeData) ? ' and its app data' : ' (app data kept)')."
+}
+
 if (-not $IsMacOS) {
     Write-Failure 'mac-move-apps only runs on macOS.'
     exit 1
 }
 
 switch ($Command) {
-    'move'    { Invoke-Move }
-    'restore' { Invoke-Restore }
-    'list'    { Show-MovableList }
-    'status'  { Show-Status }
-    'doctor'  { Invoke-Doctor }
-    'refresh' { Invoke-Refresh }
-    'help'    { Show-Usage }
+    'move'      { Invoke-Move }
+    'restore'   { Invoke-Restore }
+    'list'      { Show-MovableList }
+    'status'    { Show-Status }
+    'doctor'    { Invoke-Doctor }
+    'refresh'   { Invoke-Refresh }
+    'uninstall' { Invoke-Uninstall }
+    'help'      { Show-Usage }
     default {
         if ($Command) { Write-Failure "unknown command '$Command'." }
         Show-Usage
