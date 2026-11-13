@@ -6,6 +6,7 @@ When a referenced skill applies with this project's tweaks, the local `<name>.md
 this process is documented in the upstream repo's [local tweaks pattern](https://github.com/bevry-vibes/skills#local-tweaks-pattern).
 
 - https://github.com/bevry-vibes/skills/blob/main/policy.md — Bevry's AI policy, mandating which AIs are permitted
+- https://github.com/bevry-vibes/skills/blob/main/secrets.md — **applies.** Secrets come only from their documented locations; never probe for them, print them, or commit them
 - https://github.com/bevry-vibes/skills/blob/main/commits.md — commit hygiene
 - https://github.com/bevry-vibes/skills/blob/main/conventions.md — the bevry/base config files, the wrapping rule (break for meaning, never for width), splat naming
 - https://github.com/bevry-vibes/skills/blob/main/plans.md — cross-harness plan recording in `.plans/`
